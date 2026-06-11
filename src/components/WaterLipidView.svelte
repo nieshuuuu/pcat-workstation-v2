@@ -37,7 +37,9 @@
   let slice = $state<WlSlice | null>(null);
   let z = $state(0);
   let map = $state<WlMap>('fw');
-  let anchor = $state<WlAnchor>('adipose');
+  // Default to the theoretical pure-lipid anchor so the maps match the
+  // fw_fl_maps_theolipid reference; flip to Adipose for the fat-referenced scale.
+  let anchor = $state<WlAnchor>('theoretical');
   let ctOnly = $state(false);
 
   /** Latest-wins guard so slider scrubbing doesn't render a stale slice. */

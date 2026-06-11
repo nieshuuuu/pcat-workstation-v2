@@ -12,7 +12,7 @@ use ndarray::Array3;
 use tauri::ipc::Response;
 use serde::Serialize;
 
-use pcat_pipeline::mmd::{self, MaterialLibrary, WlAnchor, WlCalibration};
+use pcat_pipeline::mmd::{self, WlAnchor, WlCalibration};
 
 use crate::commands::framed::encode_frame;
 use crate::state::AppState;
@@ -51,8 +51,7 @@ pub async fn run_water_lipid(
     };
 
     let calib = tokio::task::spawn_blocking(move || {
-        let lib = MaterialLibrary::new(low_kev, high_kev);
-        mmd::self_calibrate(&low, &high, &lib)
+        mmd::self_calibrate(&low, &high, low_kev, high_kev)
     })
     .await
     .map_err(|e| format!("run_water_lipid task failed: {e}"))??;

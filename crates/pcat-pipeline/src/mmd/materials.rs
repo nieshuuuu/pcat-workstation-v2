@@ -55,9 +55,10 @@ const LAC_TABLE: [(f64, [f64; 4]); 7] = [
     (150.0, [0.1494, 0.1420, 0.5470, 0.3000]),
 ];
 
-/// Intrinsic mass densities (g/cm^3).
-const DENSITY_WATER: f64 = 1.000;
-const DENSITY_LIPID: f64 = 0.950;
+/// Intrinsic mass densities (g/cm^3). Canonical home — the water/lipid GLS
+/// solver references `DENSITY_WATER`/`DENSITY_LIPID` rather than re-declaring them.
+pub(crate) const DENSITY_WATER: f64 = 1.000;
+pub(crate) const DENSITY_LIPID: f64 = 0.950;
 const DENSITY_IODINE: f64 = 4.930;
 const DENSITY_CALCIUM: f64 = 3.180;
 

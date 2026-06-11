@@ -12,7 +12,7 @@ use pcat_pipeline::active_contour::{
 };
 use pcat_pipeline::annotation::{self, AnnotationBatchParams, AnnotationTarget};
 use pcat_pipeline::cpr::CprFrame;
-use pcat_pipeline::mmd::{self, MaterialLibrary, MmdResult, PwsqsParams};
+use pcat_pipeline::mmd::{self, MaterialLibrary, MmdResult, PwsqsParams, WlAnchor, WlCalibration};
 use pcat_pipeline::radial_angular::{self, CrossSectionSurface, RadialAngularParams};
 use pcat_pipeline::roi;
 
@@ -434,9 +434,9 @@ pub async fn run_mmd_on_roi(
     state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<MmdSummary, String> {
     // Validate method.
-    if method != "direct" && method != "pwsqs" {
+    if method != "direct" && method != "pwsqs" && method != "gls" {
         return Err(format!(
-            "unknown method '{method}': expected 'direct' or 'pwsqs'"
+            "unknown method '{method}': expected 'direct', 'pwsqs', or 'gls'"
         ));
     }
 
@@ -451,6 +451,7 @@ pub async fn run_mmd_on_roi(
         spacing,
         origin,
         direction,
+        existing_calib,
     ) = {
         let guard = state.lock().map_err(|e| format!("lock poisoned: {e}"))?;
 
@@ -504,6 +505,10 @@ pub async fn run_mmd_on_roi(
         let cs_width_mm = targets[0].width_mm;
         let cs_pixels = targets[0].pixels;
 
+        // GLS reuses a prior whole-volume calibration if present; otherwise the
+        // blocking task self-calibrates and we store the result below.
+        let existing_calib = guard.wl_calibration.clone();
+
         (
             (cs_width_mm, cs_pixels),
             finalized_contours,
@@ -514,6 +519,7 @@ pub async fn run_mmd_on_roi(
             de.spacing,
             de.origin,
             de.direction,
+            existing_calib,
         )
     };
 
@@ -523,7 +529,7 @@ pub async fn run_mmd_on_roi(
     let app_clone = app.clone();
 
     // Run on a blocking thread.
-    let (mmd_result, summary) = tokio::task::spawn_blocking(move || {
+    let (mmd_result, summary, fresh_calib) = tokio::task::spawn_blocking(move || {
         let _ = app_clone.emit(
             "annotation-progress",
             AnnotationProgress {
@@ -563,11 +569,15 @@ pub async fn run_mmd_on_roi(
             },
         );
 
-        // Run material decomposition.
+        // Run material decomposition. `fresh_calib` is Some only when the GLS
+        // path self-calibrated (so the caller can persist it to state).
         let materials = MaterialLibrary::new(low_kev, high_kev);
 
-        let result = match method_clone.as_str() {
-            "direct" => mmd::decompose_volume_direct(&low_energy, &high_energy, &mask, &materials),
+        let (result, fresh_calib): (MmdResult, Option<WlCalibration>) = match method_clone.as_str() {
+            "direct" => (
+                mmd::decompose_volume_direct(&low_energy, &high_energy, &mask, &materials),
+                None,
+            ),
             "pwsqs" => {
                 let params = PwsqsParams::default();
                 let app_for_cb = app_clone.clone();
@@ -582,7 +592,36 @@ pub async fn run_mmd_on_roi(
                         },
                     );
                 };
-                mmd::pwsqs_solve(&low_energy, &high_energy, &mask, &materials, &params, Some(&cb))
+                (
+                    mmd::pwsqs_solve(&low_energy, &high_energy, &mask, &materials, &params, Some(&cb)),
+                    None,
+                )
+            }
+            "gls" => {
+                // Noise-aware GLS water/lipid on the ROI mask, theoretical anchor
+                // (f_l=1 ⇒ pure lipid). Reuse the whole-volume calibration if the
+                // user already ran it; otherwise self-calibrate from this volume.
+                let _ = app_clone.emit(
+                    "annotation-progress",
+                    AnnotationProgress { stage: "wl_calibrating".into(), progress: 0.35 },
+                );
+                let (calib, fresh) = match existing_calib {
+                    Some(c) => (c, None),
+                    None => {
+                        let c = mmd::self_calibrate(&low_energy, &high_energy, low_kev, high_kev)?;
+                        (c.clone(), Some(c))
+                    }
+                };
+                (
+                    mmd::decompose_volume_gls(
+                        &low_energy,
+                        &high_energy,
+                        &mask,
+                        &calib,
+                        WlAnchor::Theoretical,
+                    ),
+                    fresh,
+                )
             }
             _ => unreachable!(),
         };
@@ -628,15 +667,19 @@ pub async fn run_mmd_on_roi(
             mean_calcium_frac: sum_c / n,
         };
 
-        Ok((result, summary))
+        Ok((result, summary, fresh_calib))
     })
     .await
     .map_err(|e| format!("run_mmd_on_roi task failed: {e}"))??;
 
-    // Store the MmdResult in state.
+    // Store the MmdResult in state; persist a freshly-measured GLS calibration
+    // so a later whole-volume Water/Lipid view reuses it.
     {
         let mut guard = state.lock().map_err(|e| format!("lock poisoned: {e}"))?;
         guard.mmd_result = Some(mmd_result);
+        if let Some(c) = fresh_calib {
+            guard.wl_calibration = Some(c);
+        }
     }
 
     let _ = app.emit(

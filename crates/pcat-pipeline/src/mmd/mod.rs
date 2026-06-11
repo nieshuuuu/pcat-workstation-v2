@@ -7,4 +7,7 @@ pub mod water_lipid;
 pub use direct::{decompose_volume_direct, MmdResult};
 pub use materials::{Material, MaterialLibrary};
 pub use pwsqs::{pwsqs_solve, PwsqsParams};
-pub use water_lipid::{decompose_slice, self_calibrate, gls_fw, sigma_cov, WlAnchor, WlCalibration};
+pub use water_lipid::{
+    decompose_slice, decompose_volume_gls, gls_fw, self_calibrate, sigma_cov, WlAnchor,
+    WlCalibration,
+};
