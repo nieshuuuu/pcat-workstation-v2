@@ -91,11 +91,10 @@
   }
 
   /** Scale range for the overlay colormap: [0, 1] for volume fractions,
-   *  [0, 1100] mg/mL (water density × 1.1 for iodine/calcium headroom) for
-   *  mass densities. Fixed ranges so contiguous cross-sections share the
-   *  same color scale. */
+   *  [0, 1000] mg/mL (≈ water density) for mass densities. Fixed ranges so
+   *  contiguous cross-sections share the same color scale. */
   function overlayRange(): [number, number] {
-    if (unit === 'mass') return [0, 1100];
+    if (unit === 'mass') return [0, 1000];
     return [0, 1];
   }
 

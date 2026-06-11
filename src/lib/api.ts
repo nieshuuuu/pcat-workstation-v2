@@ -255,8 +255,6 @@ export type MmdSummary = {
   n_voxels: number;
   mean_water_frac: number;
   mean_lipid_frac: number;
-  mean_iodine_frac: number;
-  mean_calcium_frac: number;
 };
 
 /** Generate annotation targets for all cross-section frames along a centerline.

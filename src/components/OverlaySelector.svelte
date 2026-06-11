@@ -1,8 +1,9 @@
 <script lang="ts">
   /**
    * Two-level toggle for selecting which material map to display:
-   *   Level 1 — Material (radio chips): Water | Lipid | Iodine | Calcium | Total rho
+   *   Level 1 — Material (radio chips): CT | Water | Lipid | Total rho
    *   Level 2 — Unit (toggle): Volume % | Mass (mg/mL)
+   * Water/lipid only — the 3-material solver (iodine/calcium) was dropped.
    */
 
   type Props = {
@@ -18,8 +19,6 @@
     { key: 'ct', label: 'CT' },
     { key: 'water', label: 'Water' },
     { key: 'lipid', label: 'Lipid' },
-    { key: 'iodine', label: 'Iodine' },
-    { key: 'calcium', label: 'Calcium' },
     { key: 'density', label: 'Total \u03C1' },
   ];
 

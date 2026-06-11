@@ -38,8 +38,6 @@ pub struct MmdSummary {
     pub n_voxels: usize,
     pub mean_water_frac: f64,
     pub mean_lipid_frac: f64,
-    pub mean_iodine_frac: f64,
-    pub mean_calcium_frac: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -498,7 +496,7 @@ pub async fn run_mmd_on_roi(
         // / `de.high`, so the mask shape must match those volumes exactly.
         // If the currently-active `state.volume` is a different series
         // (e.g. CCTA) with different dims, using its shape here would panic
-        // in pwsqs with a mask-shape assertion. The CPR frame + contours
+        // in the GLS solver's mask-shape assertion. The CPR frame + contours
         // live in patient mm so they're reusable across grids.
         let de_low_shape = de.low.shape();
         let volume_shape = [de_low_shape[0], de_low_shape[1], de_low_shape[2]];
@@ -601,20 +599,14 @@ pub async fn run_mmd_on_roi(
         let mask_slice = result.mask.as_slice().unwrap();
         let wf_slice = result.water_frac.as_slice().unwrap();
         let lf_slice = result.lipid_frac.as_slice().unwrap();
-        let if_slice = result.iodine_frac.as_slice().unwrap();
-        let cf_slice = result.calcium_frac.as_slice().unwrap();
 
         let mut sum_w = 0.0_f64;
         let mut sum_l = 0.0_f64;
-        let mut sum_i = 0.0_f64;
-        let mut sum_c = 0.0_f64;
 
         for idx in 0..mask_slice.len() {
             if mask_slice[idx] {
                 sum_w += wf_slice[idx] as f64;
                 sum_l += lf_slice[idx] as f64;
-                sum_i += if_slice[idx] as f64;
-                sum_c += cf_slice[idx] as f64;
             }
         }
 
@@ -626,8 +618,6 @@ pub async fn run_mmd_on_roi(
             n_voxels,
             mean_water_frac: sum_w / n,
             mean_lipid_frac: sum_l / n,
-            mean_iodine_frac: sum_i / n,
-            mean_calcium_frac: sum_c / n,
         };
 
         Ok((result, summary, fresh_calib))
@@ -670,10 +660,6 @@ fn select_material_array<'a>(
         ("water", "mass") => Ok(&mmd_result.water_mass),
         ("lipid", "fraction") => Ok(&mmd_result.lipid_frac),
         ("lipid", "mass") => Ok(&mmd_result.lipid_mass),
-        ("iodine", "fraction") => Ok(&mmd_result.iodine_frac),
-        ("iodine", "mass") => Ok(&mmd_result.iodine_mass),
-        ("calcium", "fraction") => Ok(&mmd_result.calcium_frac),
-        ("calcium", "mass") => Ok(&mmd_result.calcium_mass),
         ("density", _) => Ok(&mmd_result.total_density),
         _ => Err(format!("unknown material/unit: {material}/{unit}")),
     }
@@ -922,7 +908,7 @@ pub async fn save_annotations(
         let fin = guard.finalized.clone();
         let mmd_meta = guard.mmd_result.as_ref().map(|r| {
             (
-                "pwsqs".to_string(), // method is not stored in MmdResult, default
+                "gls".to_string(), // water/lipid GLS is the only solver
                 r.iterations,
                 r.converged,
             )
@@ -1006,10 +992,6 @@ const MATERIAL_KEYS: &[(&str, &str, &str)] = &[
     ("lipid_mass", "lipid", "mass"),
     ("water_frac", "water", "fraction"),
     ("water_mass", "water", "mass"),
-    ("iodine_frac", "iodine", "fraction"),
-    ("iodine_mass", "iodine", "mass"),
-    ("calcium_frac", "calcium", "fraction"),
-    ("calcium_mass", "calcium", "mass"),
     ("total_density", "density", "fraction"), // unit doesn't matter for density
 ];
 
@@ -1029,7 +1011,7 @@ pub async fn export_mmd_csv(
             .as_ref()
             .ok_or_else(|| "no MMD result — run decomposition first".to_string())?;
 
-        // Clone all 9 material arrays.
+        // Clone all material arrays (water/lipid + density).
         let arrays: Vec<(&str, ndarray::Array3<f32>)> = MATERIAL_KEYS
             .iter()
             .map(|(key, mat, unit)| {
@@ -1080,7 +1062,7 @@ pub async fn export_mmd_csv(
         )
     };
 
-    // Sample all 9 material surfaces on a blocking thread.
+    // Sample all material surfaces on a blocking thread.
     let csv_string = tokio::task::spawn_blocking(move || {
         let params = RadialAngularParams::default();
 
@@ -1112,7 +1094,7 @@ pub async fn export_mmd_csv(
         let mut csv = String::with_capacity(1024 * 1024);
 
         // Header
-        csv.push_str("patient_id,target_index,arc_mm,theta_deg,r_mm,lipid_frac,lipid_mass,water_frac,water_mass,iodine_frac,iodine_mass,calcium_frac,calcium_mass,total_density\n");
+        csv.push_str("patient_id,target_index,arc_mm,theta_deg,r_mm,lipid_frac,lipid_mass,water_frac,water_mass,total_density\n");
 
         // Build a lookup from key to index in all_surfaces for ordered access.
         let key_order = [
@@ -1120,10 +1102,6 @@ pub async fn export_mmd_csv(
             "lipid_mass",
             "water_frac",
             "water_mass",
-            "iodine_frac",
-            "iodine_mass",
-            "calcium_frac",
-            "calcium_mass",
             "total_density",
         ];
         let key_to_idx: HashMap<&str, usize> = all_surfaces
@@ -1159,7 +1137,7 @@ pub async fn export_mmd_csv(
                     }
 
                     // Collect values in key_order.
-                    let mut vals = [f64::NAN; 9];
+                    let mut vals = [f64::NAN; 5];
                     let mut any_nan = false;
                     for (order_idx, &key) in key_order.iter().enumerate() {
                         if let Some(&surf_idx) = key_to_idx.get(key) {
@@ -1179,14 +1157,13 @@ pub async fn export_mmd_csv(
                     use std::fmt::Write;
                     let _ = writeln!(
                         csv,
-                        "{},{},{:.4},{:.2},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+                        "{},{},{:.4},{:.2},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6}",
                         patient_id,
                         target_idx,
                         arc_mm,
                         theta,
                         r,
-                        vals[0], vals[1], vals[2], vals[3],
-                        vals[4], vals[5], vals[6], vals[7], vals[8],
+                        vals[0], vals[1], vals[2], vals[3], vals[4],
                     );
                 }
             }

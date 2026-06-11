@@ -425,11 +425,10 @@ pub fn decompose_slice(
 
 /// Decompose the masked voxels of a whole volume into water/lipid fractions by
 /// GLS, packed into the shared `MmdResult` so the existing pericoronary ROI
-/// tool (overlay, surface plot, CSV) renders f_w/f_l directly. Iodine/calcium
-/// are zero (2-material model). `f_w` is NOT clamped — muscle/fibrous voxels
-/// read f_w > 1 (the binary model's contamination signature). The drawn ROI is
-/// the selection, so the soft-tissue gate is NOT applied here. Unmasked voxels
-/// are zero.
+/// tool (overlay, surface plot, CSV) renders f_w/f_l directly. `f_w` is NOT
+/// clamped — muscle/fibrous voxels read f_w > 1 (the binary model's
+/// contamination signature). The drawn ROI is the selection, so the soft-tissue
+/// gate is NOT applied here. Unmasked voxels are zero.
 pub fn decompose_volume_gls(
     low_energy: &Array3<f32>,
     high_energy: &Array3<f32>,
@@ -484,12 +483,8 @@ pub fn decompose_volume_gls(
     MmdResult {
         water_frac: Array3::from_shape_vec(dim, wf).unwrap(),
         lipid_frac: Array3::from_shape_vec(dim, lf).unwrap(),
-        iodine_frac: Array3::<f32>::zeros(dim),
-        calcium_frac: Array3::<f32>::zeros(dim),
         water_mass: Array3::from_shape_vec(dim, wm).unwrap(),
         lipid_mass: Array3::from_shape_vec(dim, lm).unwrap(),
-        iodine_mass: Array3::<f32>::zeros(dim),
-        calcium_mass: Array3::<f32>::zeros(dim),
         total_density: Array3::from_shape_vec(dim, td).unwrap(),
         mask: mask.clone(),
         iterations: 1,
@@ -652,7 +647,6 @@ mod tests {
         assert!((r.water_frac[[0, 0, 0]] - 1.0).abs() < 1e-3, "masked water f_w≈1");
         assert!(r.lipid_frac[[0, 0, 0]].abs() < 1e-3, "masked water f_l≈0");
         assert_eq!(r.water_frac[[0, 0, 1]], 0.0, "unmasked voxel is zero");
-        assert_eq!(r.iodine_frac[[0, 0, 0]], 0.0);
         assert!(r.converged);
     }
 }
