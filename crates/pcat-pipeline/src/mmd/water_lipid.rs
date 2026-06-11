@@ -2,10 +2,11 @@
 //! the water→lipid line — ported 1:1 from `wl-noise-aware-mmd`
 //! (`src/wl_decompose.jl` + `examples/decompose_57955439_calfree.jl`).
 //!
-//! Unlike the 3-material direct/PWSQS solvers in this module, this runs on the
-//! WHOLE volume with no ROI, self-calibrates every slot from the patient's own
-//! anatomy (no external phantom), and reports a per-voxel water fraction f_w
-//! plus its standard deviation σ_f. The lipid fraction is `1 − f_w`.
+//! This is the sole material-decomposition solver (the ill-conditioned
+//! 3-material direct/PWSQS solvers were dropped). It runs on the WHOLE volume
+//! with no ROI, self-calibrates every slot from the patient's own anatomy (no
+//! external phantom), and reports a per-voxel water fraction f_w plus its
+//! standard deviation σ_f. The lipid fraction is `1 − f_w`.
 //!
 //! The estimator core (`gls_fw`, `sigma_cov`) is pure and deterministic; the
 //! calibration scan is the only volume-wide pass. The whole-volume viewer
@@ -17,7 +18,7 @@ use ndarray::Array3;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use super::direct::MmdResult;
+use super::result::MmdResult;
 
 /// Lipid endpoint choice. Both anchors share Σ, ρ, the noise lines and the
 /// gate; only `HU_l` (hence the line direction `g`) differs.
@@ -36,10 +37,9 @@ pub enum WlAnchor {
 /// 1000·(μ_lipid(E)/μ_water(E) − 1)` vs energy (keV). Baked from
 /// wl-noise-aware-mmd `theoretical_endpoints` (src/wl_analysis.jl) so the
 /// workstation reproduces the reference theoretical anchor without a Julia /
-/// BasisSimulator dependency. This is a SEPARATE source from the adipose
-/// `Material::Lipid` LAC table used by the 3-material solver — pure
-/// triglyceride is not adipose tissue. Verified: 70→−111.69, 150→−81.21
-/// match the reference TOML exactly.
+/// BasisSimulator dependency. Pure triglyceride is not adipose tissue, so this
+/// is its own curve — distinct from the patient-measured adipose endpoint
+/// (`hu_l_adipose`). Verified: 70→−111.69, 150→−81.21 match the reference TOML.
 const THEO_LIPID_HU: [(f64, f64); 7] = [
     (40.0, -212.7195),
     (60.0, -129.1293),
@@ -164,7 +164,7 @@ fn theo_lipid_hu_at(energy: f64) -> f64 {
 }
 
 /// Theoretical pure-lipid endpoint HU at (low, high) keV from the baked NIST
-/// triglyceride curve — independent of the adipose `Material::Lipid` LAC.
+/// triglyceride curve.
 fn theoretical_lipid_hu(low_kev: f64, high_kev: f64) -> [f64; 2] {
     [theo_lipid_hu_at(low_kev), theo_lipid_hu_at(high_kev)]
 }

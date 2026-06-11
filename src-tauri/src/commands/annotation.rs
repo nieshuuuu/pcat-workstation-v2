@@ -12,7 +12,7 @@ use pcat_pipeline::active_contour::{
 };
 use pcat_pipeline::annotation::{self, AnnotationBatchParams, AnnotationTarget};
 use pcat_pipeline::cpr::CprFrame;
-use pcat_pipeline::mmd::{self, MaterialLibrary, MmdResult, PwsqsParams, WlAnchor, WlCalibration};
+use pcat_pipeline::mmd::{self, MmdResult, WlAnchor, WlCalibration};
 use pcat_pipeline::radial_angular::{self, CrossSectionSurface, RadialAngularParams};
 use pcat_pipeline::roi;
 
@@ -433,10 +433,12 @@ pub async fn run_mmd_on_roi(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<MmdSummary, String> {
-    // Validate method.
-    if method != "direct" && method != "pwsqs" && method != "gls" {
+    // Validate method. Noise-aware water/lipid GLS is the only solver; the
+    // 3-material direct/PWSQS solvers were dropped (ill-conditioned at
+    // soft-tissue contrast).
+    if method != "gls" {
         return Err(format!(
-            "unknown method '{method}': expected 'direct', 'pwsqs', or 'gls'"
+            "unknown method '{method}': only 'gls' (noise-aware water/lipid) is supported"
         ));
     }
 
@@ -569,62 +571,23 @@ pub async fn run_mmd_on_roi(
             },
         );
 
-        // Run material decomposition. `fresh_calib` is Some only when the GLS
-        // path self-calibrated (so the caller can persist it to state).
-        let materials = MaterialLibrary::new(low_kev, high_kev);
-
-        let (result, fresh_calib): (MmdResult, Option<WlCalibration>) = match method_clone.as_str() {
-            "direct" => (
-                mmd::decompose_volume_direct(&low_energy, &high_energy, &mask, &materials),
-                None,
-            ),
-            "pwsqs" => {
-                let params = PwsqsParams::default();
-                let app_for_cb = app_clone.clone();
-                let max_iter = params.max_iter;
-                let cb = move |iter: usize, _delta: f64| {
-                    let progress = 0.3 + 0.6 * (iter as f64 / max_iter as f64);
-                    let _ = app_for_cb.emit(
-                        "annotation-progress",
-                        AnnotationProgress {
-                            stage: format!("pwsqs_iter_{iter}"),
-                            progress,
-                        },
-                    );
-                };
-                (
-                    mmd::pwsqs_solve(&low_energy, &high_energy, &mask, &materials, &params, Some(&cb)),
-                    None,
-                )
+        // Noise-aware GLS water/lipid decomposition on the ROI mask, theoretical
+        // anchor (f_l=1 ⇒ pure lipid). Reuse the whole-volume calibration if the
+        // user already ran it; otherwise self-calibrate from this volume and
+        // persist it (`fresh_calib` is Some only when freshly measured).
+        let _ = app_clone.emit(
+            "annotation-progress",
+            AnnotationProgress { stage: "wl_calibrating".into(), progress: 0.35 },
+        );
+        let (calib, fresh_calib): (WlCalibration, Option<WlCalibration>) = match existing_calib {
+            Some(c) => (c, None),
+            None => {
+                let c = mmd::self_calibrate(&low_energy, &high_energy, low_kev, high_kev)?;
+                (c.clone(), Some(c))
             }
-            "gls" => {
-                // Noise-aware GLS water/lipid on the ROI mask, theoretical anchor
-                // (f_l=1 ⇒ pure lipid). Reuse the whole-volume calibration if the
-                // user already ran it; otherwise self-calibrate from this volume.
-                let _ = app_clone.emit(
-                    "annotation-progress",
-                    AnnotationProgress { stage: "wl_calibrating".into(), progress: 0.35 },
-                );
-                let (calib, fresh) = match existing_calib {
-                    Some(c) => (c, None),
-                    None => {
-                        let c = mmd::self_calibrate(&low_energy, &high_energy, low_kev, high_kev)?;
-                        (c.clone(), Some(c))
-                    }
-                };
-                (
-                    mmd::decompose_volume_gls(
-                        &low_energy,
-                        &high_energy,
-                        &mask,
-                        &calib,
-                        WlAnchor::Theoretical,
-                    ),
-                    fresh,
-                )
-            }
-            _ => unreachable!(),
         };
+        let result: MmdResult =
+            mmd::decompose_volume_gls(&low_energy, &high_energy, &mask, &calib, WlAnchor::Theoretical);
 
         let _ = app_clone.emit(
             "annotation-progress",

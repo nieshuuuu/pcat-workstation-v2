@@ -345,9 +345,10 @@ export async function useVesselWallAsContour(
   });
 }
 
-/** Run multi-material decomposition on the annotated ROI. */
+/** Run noise-aware water/lipid (GLS) decomposition on the annotated ROI.
+ *  'gls' is the only supported method (the 3-material solvers were dropped). */
 export async function runMmdOnRoi(
-  method: string = 'direct',
+  method: string = 'gls',
 ): Promise<MmdSummary> {
   return invoke<MmdSummary>('run_mmd_on_roi', { method });
 }

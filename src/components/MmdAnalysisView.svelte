@@ -65,9 +65,6 @@
   let mmdSummary = $state<MmdSummary | null>(null);
   let mmdBusy = $state(false);
   let mmdError = $state('');
-  // Decomposition method for the ROI. 'gls' = noise-aware water/lipid GLS
-  // (default — the latest method); 'pwsqs'/'direct' = legacy 3-material solvers.
-  let mmdMethod = $state('gls');
 
   /** Per-target flat material overlay (pixels×pixels) for the current
    *  material/unit. Lazily fetched after MMD runs when the user focuses a
@@ -259,7 +256,7 @@
     mmdError = '';
     overlayCache = {}; // stale now
     try {
-      mmdSummary = await runMmdOnRoi(mmdMethod);
+      mmdSummary = await runMmdOnRoi('gls');
       await refreshSurfaces();
     } catch (err) {
       mmdError = err instanceof Error ? err.message : String(err);
@@ -358,23 +355,13 @@
       />
 
       <div class="ml-auto flex items-center gap-2">
-        <select
-          class="rounded bg-surface-tertiary px-2 py-1 text-xs text-text-primary disabled:opacity-50"
-          bind:value={mmdMethod}
-          disabled={mmdBusy}
-          title="Decomposition method for the ROI"
-        >
-          <option value="gls">Water/Lipid GLS</option>
-          <option value="pwsqs">PWSQS (3-mat)</option>
-          <option value="direct">Direct (3-mat)</option>
-        </select>
         <button
           class="rounded bg-accent/15 px-3 py-1 text-xs font-medium text-accent hover:bg-accent/25 active:bg-accent/35 disabled:bg-surface-tertiary/40 disabled:text-text-secondary/70"
           onclick={handleRunMmd}
           disabled={mmdBusy || contourCount === 0}
-          title="Run the selected material decomposition on the current contours"
+          title="Run noise-aware water/lipid (GLS) decomposition on the current contours"
         >
-          {mmdBusy ? 'Running MMD...' : 'Run MMD'}
+          {mmdBusy ? 'Running...' : 'Run Water/Lipid'}
         </button>
 
         <button
