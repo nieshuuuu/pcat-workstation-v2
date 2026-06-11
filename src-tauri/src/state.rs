@@ -6,7 +6,7 @@ use pcat_pipeline::annotation::AnnotationTarget;
 use pcat_pipeline::cpr::CprFrame;
 use pcat_pipeline::dicom_load::VolumeMetadata as PipelineVolumeMetadata;
 use pcat_pipeline::dicom_loader::DualEnergyVolume;
-use pcat_pipeline::mmd::MmdResult;
+use pcat_pipeline::mmd::{MmdResult, WlCalibration};
 pub use pcat_pipeline::types::LoadedVolume;
 
 use crate::volume_cache::{VolumeCache, VOLUME_CACHE_MAX};
@@ -55,6 +55,10 @@ pub struct AppState {
     pub finalized: HashMap<usize, bool>,
     /// Most recent MMD decomposition result.
     pub mmd_result: Option<MmdResult>,
+    /// Self-measured calibration for the whole-volume GLS water/lipid solver.
+    /// The single source of truth — per-slice f_w/σ_f maps are derived from it
+    /// on demand by `get_wl_slice`, so no result volume is cached.
+    pub wl_calibration: Option<WlCalibration>,
     /// (dicom_dir, series_uid) of the volume currently in `volume`. None if
     /// unloaded. Used by reuse_loaded_volume to skip re-decode on A→B→A reload.
     pub current_volume_key: Option<(String, String)>,
@@ -76,6 +80,7 @@ impl AppState {
             snake_contours: HashMap::new(),
             finalized: HashMap::new(),
             mmd_result: None,
+            wl_calibration: None,
             current_volume_key: None,
             last_metadata: None,
         }

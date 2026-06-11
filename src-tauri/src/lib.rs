@@ -49,6 +49,8 @@ pub fn run() {
             commands::annotation::save_annotations,
             commands::annotation::load_annotations,
             commands::annotation::export_mmd_csv,
+            commands::water_lipid::run_water_lipid,
+            commands::water_lipid::get_wl_slice,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

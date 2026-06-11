@@ -380,6 +380,82 @@ export async function getMmdOverlay(
   return invoke<number[]>('get_mmd_overlay', { targetIndex, material, unit });
 }
 
+/* ── Whole-volume noise-aware GLS water/lipid decomposition ─────────────────
+ *
+ * The latest method (ported from wl-noise-aware-mmd): self-calibrated, runs on
+ * the whole dual-energy volume, renders axial f_w/f_l maps like
+ * fw_fl_maps_theolipid_57955439.png. Calibration is the single source of truth;
+ * slices are derived on demand by `getWlSlice`. */
+
+export type WlAnchor = 'adipose' | 'theoretical';
+
+/** Self-measured calibration returned by `runWaterLipid`. Mirrors the Rust
+ *  `WlCalibration` struct (snake_case fields). All endpoints/noise lines are
+ *  measured from the patient's own fat + muscle — no external phantom. */
+export type WlCalibration = {
+  low_kev: number;
+  high_kev: number;
+  hu_w: [number, number];
+  hu_l_adipose: [number, number];
+  hu_l_theo: [number, number];
+  hu_mus: [number, number];
+  ab_low: [number, number];
+  ab_high: [number, number];
+  sigma_fat: [number, number];
+  sigma_mus: [number, number];
+  rho: number;
+  gate: [number, number];
+  n_fat: number;
+  n_mus: number;
+  fraction_kept: number;
+  /** [nz, ny, nx] of the dual-energy grid. */
+  dims: [number, number, number];
+};
+
+/** One decoded axial slice: CT HU (i16) + water fraction + σ_f (both f32, NaN
+ *  outside the soft-tissue gate). f_l = 1 − f_w is derived on the client. */
+export type WlSlice = {
+  z: number;
+  ny: number;
+  nx: number;
+  anchor: WlAnchor;
+  ct: Int16Array;
+  fw: Float32Array;
+  sf: Float32Array;
+};
+
+/** Self-calibrate + register the whole-volume GLS water/lipid solver for the
+ *  loaded dual-energy volume. Returns the measured calibration. Run once. */
+export async function runWaterLipid(): Promise<WlCalibration> {
+  return invoke<WlCalibration>('run_water_lipid');
+}
+
+/** Derive one axial slice's CT + f_w + σ_f maps from the stored calibration. */
+export async function getWlSlice(z: number, anchor: WlAnchor): Promise<WlSlice> {
+  const buf = await invoke<ArrayBuffer>('get_wl_slice', { z, anchor });
+  const view = new DataView(buf);
+  const metaLen = view.getUint32(0, true);
+  const metaBytes = new Uint8Array(buf, 4, metaLen);
+  const meta = JSON.parse(new TextDecoder().decode(metaBytes)) as {
+    z: number;
+    ny: number;
+    nx: number;
+    anchor: WlAnchor;
+  };
+
+  const plane = meta.ny * meta.nx;
+  let off = 4 + metaLen;
+  // Copy each region into its own buffer — guarantees the typed-array
+  // alignment Int16Array/Float32Array require regardless of the JSON length.
+  const ct = new Int16Array(buf.slice(off, off + plane * 2));
+  off += plane * 2;
+  const fw = new Float32Array(buf.slice(off, off + plane * 4));
+  off += plane * 4;
+  const sf = new Float32Array(buf.slice(off, off + plane * 4));
+
+  return { z: meta.z, ny: meta.ny, nx: meta.nx, anchor: meta.anchor, ct, fw, sf };
+}
+
 /* ── Save/Load annotations + CSV export ───────────────── */
 
 export type AnnotationStateJson = {

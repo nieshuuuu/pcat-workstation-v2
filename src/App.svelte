@@ -10,6 +10,7 @@
    */
   import MprPanel from './components/MprPanel.svelte';
   import MmdAnalysisView from './components/MmdAnalysisView.svelte';
+  import WaterLipidView from './components/WaterLipidView.svelte';
   import PatientBrowser from './components/PatientBrowser.svelte';
   import SeedToolbar from './components/SeedToolbar.svelte';
   import HintLine from './components/HintLine.svelte';
@@ -36,7 +37,7 @@
   import { navigateToWorldPos } from '$lib/navigation';
 
   /* ── Tab state ─────────────────────────────────────── */
-  type AppTab = 'editor' | 'mmd';
+  type AppTab = 'editor' | 'mmd' | 'wl';
   let activeTab = $state<AppTab>('editor');
 
   /** Centerline of the currently active vessel (for MmdAnalysisView). */
@@ -645,6 +646,18 @@
           <span class="absolute inset-x-0 bottom-0 h-[2px] bg-accent"></span>
         {/if}
       </button>
+      <button
+        class="relative px-3 py-1.5 text-xs font-medium transition-colors {activeTab === 'wl'
+          ? 'text-accent'
+          : 'text-text-secondary hover:text-text-primary'}"
+        onclick={() => { activeTab = 'wl'; }}
+        title="Whole-volume noise-aware GLS water/lipid decomposition"
+      >
+        Water/Lipid
+        {#if activeTab === 'wl'}
+          <span class="absolute inset-x-0 bottom-0 h-[2px] bg-accent"></span>
+        {/if}
+      </button>
     </nav>
   {/if}
 
@@ -672,6 +685,12 @@
         class:hidden={activeTab !== 'mmd'}
       >
         <MmdAnalysisView centerlineMm={activeCenterlineMm} />
+      </div>
+      <div
+        class="absolute inset-0 flex flex-col"
+        class:hidden={activeTab !== 'wl'}
+      >
+        <WaterLipidView />
       </div>
     {/if}
   </main>
