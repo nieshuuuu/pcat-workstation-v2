@@ -45,7 +45,6 @@ export type FaiStats = {
       n_voxels: number;
       fai_risk: string;
     }[];
-    per_position_mean: number[][];
   } | null;
 };
 

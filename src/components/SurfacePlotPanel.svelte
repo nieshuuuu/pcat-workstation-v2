@@ -9,7 +9,7 @@
    * pericoronary "term structure" surface. The arc-length slider and the 2D
    * cross-section view share one index, so moving either moves both.
    */
-  import { onMount, tick } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { MMD_MASS_MAX_MGML, type CrossSectionSurface } from '$lib/api';
 
   type Props = {
@@ -36,13 +36,25 @@
   let Plotly: typeof import('plotly.js-dist-min') | null = $state(null);
   let plotlyLoaded = $state(false);
 
-  // Gaussian smoothing widths in grid cells, on the dense 72×40 sampling grid
-  // (5° angular, 0.25 mm radial). σ_θ=2.5 cells ≈ 30° FWHM and σ_r=2 cells ≈
-  // 1.2 mm FWHM — wide enough to erase per-voxel GLS speckle (the "can't see
-  // anything" noise) while preserving the gross angular asymmetry and the
-  // radial fat profile that are the actual pericoronary signal.
-  const SIGMA_THETA = 2.5;
-  const SIGMA_R = 2.0;
+  // Denoise the per-voxel GLS speckle in PHYSICAL units (derived per surface from
+  // its angular/radial step), sized to PRESERVE the thin radial fat↔muscle
+  // boundary that is the actual signal. Smoothing is mostly ANGULAR — averaging
+  // around the ring at fixed radius cuts speckle without touching the radial
+  // profile. The RADIAL kernel is deliberately tiny: enough to bridge a single
+  // empty ring, NOT to smear the few-mm fat band (a wide radial blur is exactly
+  // what erases the boundary we measure).
+  const SMOOTH_THETA_FWHM_DEG = 20;
+  const SMOOTH_R_FWHM_MM = 0.5;
+  const FWHM_TO_SIGMA = 1 / 2.3548; // FWHM = 2·√(2 ln 2)·σ
+
+  // Memoize the smoothed grid per (section, unit): revisiting a section — slider
+  // scrub-back, camera rotate, resize — is then free; only a never-seen section
+  // pays for the Gaussian. Reset when `surfaces` is replaced (a new MMD run).
+  let smoothCache = new Map<string, (number | null)[][]>();
+  let smoothCacheFor: CrossSectionSurface[] | null = null;
+
+  // Coalesce rapid re-renders (slider drag) into one per animation frame.
+  let rafId: number | null = null;
 
   onMount(async () => {
     const mod = await import('plotly.js-dist-min');
@@ -90,6 +102,8 @@
     nR: number,
     lo: number,
     hi: number,
+    sigmaTheta: number,
+    sigmaR: number,
   ): (number | null)[][] {
     // Pre-clamp finite values so a single −50 % outlier can't drag a whole
     // neighbourhood down before it is averaged.
@@ -103,8 +117,8 @@
       }
     }
 
-    const kt = gaussianKernel(SIGMA_THETA);
-    const kr = gaussianKernel(SIGMA_R);
+    const kt = gaussianKernel(sigmaTheta);
+    const kr = gaussianKernel(sigmaR);
     const rt = (kt.length - 1) / 2;
     const rr = (kr.length - 1) / 2;
 
@@ -166,13 +180,29 @@
     const s = surfaces[selectedIndex];
     const [lo, hi] = displayRange(unit);
 
-    // Convert fractions to vol% up front, then denoise + clamp on the smoother.
-    const scaled = new Array<number>(s.surface.length);
-    for (let i = 0; i < s.surface.length; i++) {
-      const val = s.surface[i];
-      scaled[i] = Number.isNaN(val) ? NaN : unit === 'fraction' ? val * 100 : val;
+    // Smoothed grid, memoized per (section, unit). Cleared when surfaces change.
+    if (smoothCacheFor !== surfaces) {
+      smoothCache.clear();
+      smoothCacheFor = surfaces;
     }
-    const z = smoothGrid(scaled, s.n_theta, s.n_radial, lo, hi);
+    const cacheKey = `${selectedIndex}|${unit}`;
+    let z = smoothCache.get(cacheKey);
+    if (!z) {
+      // Convert fractions to vol% up front, then denoise + clamp on the smoother.
+      const scaled = new Array<number>(s.surface.length);
+      for (let i = 0; i < s.surface.length; i++) {
+        const val = s.surface[i];
+        scaled[i] = Number.isNaN(val) ? NaN : unit === 'fraction' ? val * 100 : val;
+      }
+      // Gaussian widths from THIS surface's own grid step → fixed physical FWHM,
+      // independent of the backend sampling density.
+      const dThetaDeg = s.n_theta > 0 ? 360 / s.n_theta : 1;
+      const dRmm = s.n_radial > 1 ? Math.abs(s.r_mm[1] - s.r_mm[0]) : 1;
+      const sigmaTheta = (SMOOTH_THETA_FWHM_DEG * FWHM_TO_SIGMA) / dThetaDeg;
+      const sigmaR = (SMOOTH_R_FWHM_MM * FWHM_TO_SIGMA) / dRmm;
+      z = smoothGrid(scaled, s.n_theta, s.n_radial, lo, hi, sigmaTheta, sigmaR);
+      smoothCache.set(cacheKey, z);
+    }
 
     const label = materialLabel(material, unit);
     const trace: Partial<Plotly.Data> = {
@@ -232,6 +262,31 @@
     (P as any).react(div, [trace], layout, { responsive: true, displayModeBar: false });
   }
 
+  // Plotly attaches a WebGL context to the plot div; if the div is removed
+  // (surfaces emptied on a vessel switch / reload) without purging, the context
+  // leaks and after enough cycles the webview refuses new ones and the surface
+  // stops drawing. This action purges on the div's removal — covering both the
+  // {#if} unmount and component teardown.
+  function plotContainer(node: HTMLDivElement) {
+    plotDiv = node;
+    return {
+      destroy() {
+        if (Plotly) (Plotly as any).purge(node);
+        if (plotDiv === node) plotDiv = undefined;
+      },
+    };
+  }
+
+  // Coalesce re-renders into one per frame (cancel any pending frame first), so
+  // a fast slider drag smooths + redraws only the section the user lands on.
+  function scheduleRender() {
+    if (rafId != null) cancelAnimationFrame(rafId);
+    rafId = requestAnimationFrame(() => {
+      rafId = null;
+      if (Plotly && plotDiv) renderPlot(Plotly, plotDiv);
+    });
+  }
+
   // Re-render when dependencies change.
   $effect(() => {
     if (!plotlyLoaded || !Plotly || !plotDiv) return;
@@ -239,9 +294,11 @@
     void selectedIndex;
     void material;
     void unit;
-    tick().then(() => {
-      if (Plotly && plotDiv) renderPlot(Plotly, plotDiv);
-    });
+    scheduleRender();
+  });
+
+  onDestroy(() => {
+    if (rafId != null) cancelAnimationFrame(rafId);
   });
 </script>
 
@@ -257,7 +314,7 @@
         <span class="text-xs text-text-secondary">Run MMD to generate surface data</span>
       </div>
     {:else}
-      <div bind:this={plotDiv} class="h-full w-full"></div>
+      <div use:plotContainer class="h-full w-full"></div>
     {/if}
   </div>
 

@@ -213,6 +213,36 @@
     selectedIndex = Math.max(0, Math.min(max, index));
   }
 
+  // `selectedIndex` is a TARGET index (drives the 2D editor + the overlay). The
+  // 3D plot indexes its own `surfaces[]`, which the backend PACKS — a contourless
+  // target yields no surface. Map between the two by arc-length so both views
+  // always show the SAME physical section even when the counts differ; in the
+  // common 1:1 case this is just the identity.
+  function targetToSurfaceIndex(ti: number): number {
+    if (surfaces.length === 0) return 0;
+    const arc = targets[ti]?.arc_mm;
+    if (arc == null) return Math.min(ti, surfaces.length - 1);
+    let best = 0;
+    let bestD = Infinity;
+    for (let i = 0; i < surfaces.length; i++) {
+      const d = Math.abs(surfaces[i].arc_mm - arc);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  }
+  function surfaceToTargetIndex(si: number): number {
+    const arc = surfaces[si]?.arc_mm;
+    if (arc == null) return Math.min(si, Math.max(0, targets.length - 1));
+    let best = 0;
+    let bestD = Infinity;
+    for (let i = 0; i < targets.length; i++) {
+      const d = Math.abs(targets[i].arc_mm - arc);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  }
+  let selectedSurfaceIndex = $derived(targetToSurfaceIndex(selectedIndex));
+
   async function handleSave() {
     if (saveBusy || !dicomPath) return;
     saveBusy = true;
@@ -333,19 +363,19 @@
     if (material === 'ct') return; // surfaces are only defined for decomposed materials
     try {
       surfaces = await sampleSurfaces(material, unit);
-      // The shared section index addresses both targets[] and surfaces[]
-      // positionally, which is only correct while they stay 1:1 (every target
-      // auto-adopts a lumen contour → one surface). If the backend ever packs
-      // the surfaces vector (e.g. skipping a contourless target), positions
-      // would desync silently — fail loud here instead.
+      // The 2D (targets[]) and 3D (surfaces[]) views are linked by arc-length
+      // (see targetToSurfaceIndex), so a packed surfaces vector no longer desyncs
+      // them — but a mismatch still means some sections lack a 3D surface, which
+      // is worth surfacing.
       if (surfaces.length !== targets.length) {
         console.warn(
           `MMD surface/target count mismatch (${surfaces.length} vs ${targets.length}); ` +
-            'the 2D cross-section and 3D surface may show different sections.',
+            'views stay aligned by arc-length, but some sections have no 3D surface.',
         );
       }
-      // Keep the shared section index in range of the freshly sampled surfaces.
-      selectedIndex = Math.min(selectedIndex, Math.max(0, surfaces.length - 1));
+      // selectedIndex is a TARGET index — clamp to the targets range (NOT
+      // surfaces.length; the 3D plot is addressed via the arc-length mapping).
+      selectedIndex = Math.min(selectedIndex, Math.max(0, targets.length - 1));
     } catch (err) {
       console.error('Failed to sample surfaces:', err);
     }
@@ -388,10 +418,10 @@
       <div class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <SurfacePlotPanel
           {surfaces}
-          {selectedIndex}
+          selectedIndex={selectedSurfaceIndex}
           {material}
           {unit}
-          onSliderChange={handleSelect}
+          onSliderChange={(si) => handleSelect(surfaceToTargetIndex(si))}
           {arcOffsetMm}
         />
 

@@ -10,6 +10,7 @@
   import CprView from './CprView.svelte';
   import AnalysisDashboard from './AnalysisDashboard.svelte';
   import { pipelineStore } from '$lib/stores/pipelineStore.svelte';
+  import { uiStore } from '$lib/stores/uiStore.svelte';
 
   type Props = {
     phase: 'empty' | 'dicom' | 'seeds' | 'analysis';
@@ -24,8 +25,12 @@
   let hasCpr = $derived(phase === 'seeds' || phase === 'analysis');
 
   // Fullscreen the Analysis dashboard — it's otherwise confined to this narrow
-  // side panel, which is too cramped for the radial/angular charts.
-  let maximized = $state(false);
+  // side panel, which is too cramped for the radial/angular charts. The flag
+  // lives in uiStore so App's root keydown handler owns Escape: closing the
+  // overlay there can't also fire App's "clear vessel" shortcut. (A local
+  // window keydown here couldn't prevent that — App's listener is on the same
+  // window target and runs regardless of stopPropagation.)
+  let maximized = $derived(uiStore.analysisMaximized);
 
   // Auto-switch to analysis tab when pipeline first completes
   $effect(() => {
@@ -34,15 +39,13 @@
     }
   });
 
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape' && maximized) {
-      maximized = false;
-      e.stopPropagation();
-    }
-  }
+  // Never leave the overlay stuck open once its results are gone (centerline
+  // cleared, patient switched): otherwise the NEXT completed pipeline would pop
+  // straight into fullscreen unrequested.
+  $effect(() => {
+    if (!hasResults) uiStore.analysisMaximized = false;
+  });
 </script>
-
-<svelte:window onkeydown={handleKeydown} />
 
 <div
   class="flex h-full w-full flex-col bg-surface-secondary text-text-primary"
@@ -141,7 +144,7 @@
         {#if contextTab === 'analysis'}
           <button
             class="ml-auto px-2.5 text-xs font-medium text-text-secondary transition-colors hover:text-accent"
-            onclick={() => (maximized = true)}
+            onclick={() => (uiStore.analysisMaximized = true)}
             title="Fullscreen analysis"
             aria-label="Fullscreen analysis"
           >
@@ -176,7 +179,7 @@
       </span>
       <button
         class="rounded bg-surface-tertiary px-3 py-1 text-xs font-medium text-text-primary hover:bg-surface-tertiary/80"
-        onclick={() => (maximized = false)}
+        onclick={() => (uiStore.analysisMaximized = false)}
         title="Exit fullscreen (Esc)"
       >
         ✕ Close

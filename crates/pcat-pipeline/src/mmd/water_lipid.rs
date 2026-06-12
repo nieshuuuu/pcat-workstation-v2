@@ -362,19 +362,30 @@ pub fn self_calibrate(
         0.0
     };
 
-    // Soft-tissue gate on the low-energy HU: [lo, hi]. The job of the LOWER
-    // bound is to drop gas/lung/air (HU ≲ −350), NOT to clip the fat itself.
-    // The old bound `hu_l[0] - 40` sat barely below the *mean* subcutaneous-fat
-    // HU (~1–2σ), so the lower tail of genuine adipose — the most lipid-rich and
-    // the noisiest voxels, i.e. exactly the pericoronary fat we measure — fell
-    // outside and was dropped to NaN (e.g. a −157 HU fat voxel at a vessel edge
-    // where low-keV noise + partial volume push it down). Place the lower bound
-    // several fat-noise σ below the adipose endpoint so the whole fat
-    // distribution is kept, and clamp it to a physical fat↔lung window: never
-    // above −200 (keeps even pure fat in low-noise scans) and never below −350
-    // (never admits lung/gas). σ scales it for the noisier low-keV/PCCT regime.
-    let gate_lo = (hu_l[0] - 6.0 * sigma_fat[0]).clamp(-350.0, -200.0);
-    let gate = [gate_lo, 150.0];
+    // Soft-tissue gate on the low-energy HU: [lo, hi]. The LOWER bound exists to
+    // drop gas/lung/air, NOT to clip the fat itself. The old bound `hu_l[0] - 40`
+    // (≈ −130) sat ~1–2σ below the *mean* subcutaneous-fat HU, so the lower tail
+    // of genuine adipose — the most lipid-rich, noisiest voxels, i.e. exactly the
+    // pericoronary fat we measure — fell outside and was dropped to NaN (e.g. a
+    // −157 HU fat voxel at a vessel edge where low-keV noise + partial volume push
+    // it down).
+    //
+    // The bound is the adipose endpoint widened by GATE_FAT_NOISE_K·σ_fat, then
+    // clamped to a physical fat↔lung window. What that actually does, by regime:
+    //   • Normal-dose CCTA (σ_fat ≈ 10): hu_l[0] − 6σ ≈ −150, which clamps UP to
+    //     GATE_FLOOR_MAX, so the floor sits at −200 and the σ term does nothing —
+    //     here the gate is effectively a fixed −200 "keep all fat" bound.
+    //   • Noisy low-keV / PCCT (σ_fat large): the σ term wins and the floor slides
+    //     toward GATE_FLOOR_MIN = −350, admitting more of the noisy fat tail (and,
+    //     unavoidably, some air↔fat partial-volume voxels in that band). If a study
+    //     needs stricter lung exclusion, raise GATE_FLOOR_MIN (e.g. to −300).
+    const GATE_FAT_NOISE_K: f64 = 6.0;
+    const GATE_FLOOR_MIN_HU: f64 = -350.0; // never admit frank lung/gas
+    const GATE_FLOOR_MAX_HU: f64 = -200.0; // always keep fat down to here
+    const GATE_HI_HU: f64 = 150.0;
+    let gate_lo =
+        (hu_l[0] - GATE_FAT_NOISE_K * sigma_fat[0]).clamp(GATE_FLOOR_MIN_HU, GATE_FLOOR_MAX_HU);
+    let gate = [gate_lo, GATE_HI_HU];
 
     // Fraction of volume voxels that pass the gate.
     let kept: usize = lo

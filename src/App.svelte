@@ -35,6 +35,7 @@
   import type { VolumeMetadata } from '$lib/stores/volumeStore.svelte';
   import { pipelineStore } from '$lib/stores/pipelineStore.svelte';
   import { seedStore, type Vessel } from '$lib/stores/seedStore.svelte';
+  import { uiStore } from '$lib/stores/uiStore.svelte';
   import { navigateToWorldPos } from '$lib/navigation';
 
   /* ── Tab state ─────────────────────────────────────── */
@@ -68,6 +69,15 @@
 
   // ---- Keyboard shortcuts ----
   function handleKeydown(event: KeyboardEvent) {
+    // Escape closes the fullscreen analysis overlay FIRST and stops there — it
+    // must not also run the "clear vessel" shortcut below. Both fire on this one
+    // window keydown, and the overlay's own stopPropagation can't prevent it, so
+    // the guard lives here, at the single owner of the flag.
+    if (event.key === 'Escape' && uiStore.analysisMaximized) {
+      uiStore.analysisMaximized = false;
+      return;
+    }
+
     // Ignore if user is typing in an input/textarea
     const tag = (event.target as HTMLElement)?.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;

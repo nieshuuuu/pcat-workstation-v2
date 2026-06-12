@@ -25,6 +25,7 @@
     type WlSlice,
     type WlAnchor,
   } from '$lib/api';
+  import { jet, CT_LO, CT_HI } from '$lib/colormap';
 
   type WlMap = 'fw' | 'fl' | 'sf';
 
@@ -56,23 +57,9 @@
   // floating tooltip). fw/sf are the estimate + its standard deviation at (x,y).
   let hover = $state<{ x: number; y: number; hu: number; fw: number; sf: number; cx: number; cy: number } | null>(null);
 
-  // CT window matching the reference figure's grayscale underlay.
-  const CT_LO = -160;
-  const CT_HI = 240;
-
   let nz = $derived(calib?.dims[0] ?? 0);
 
   /* ── Colormaps ──────────────────────────────────────────── */
-
-  /** Classic jet (matplotlib): t∈[0,1] → blue→cyan→green→yellow→red. Matches
-   *  the reference figure's f_w/f_l panels. */
-  function jet(t: number): [number, number, number] {
-    const u = Math.max(0, Math.min(1, t));
-    const r = Math.max(0, Math.min(1, 1.5 - Math.abs(4 * u - 3)));
-    const g = Math.max(0, Math.min(1, 1.5 - Math.abs(4 * u - 2)));
-    const b = Math.max(0, Math.min(1, 1.5 - Math.abs(4 * u - 1)));
-    return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
-  }
 
   // Viridis control points for the σ_f panel.
   const VIRIDIS: [number, number, number][] = [
@@ -136,9 +123,12 @@
 
   async function fetchSlice() {
     if (!calib) return;
-    // Coalesce: never run two requests at once. Mark pending and return; the
-    // in-flight call re-fires for the latest z/anchor when it settles.
+    // Coalesce: never run two requests at once. A newer request supersedes the
+    // one in flight, so bump the latest-wins token (the in-flight response is now
+    // stale and must not commit its slice) and mark pending to chase the current
+    // z/anchor once it settles.
     if (fetchInflight) {
+      fetchSeq++;
       fetchPending = true;
       return;
     }

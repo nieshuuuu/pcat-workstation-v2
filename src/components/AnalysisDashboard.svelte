@@ -108,9 +108,14 @@
       const stdHu = profile.std_hu ?? [];
       const color = VESSEL_COLORS[vessel];
 
-      // Filter out NaN values for clean plotting
+      // Filter out empty rings before plotting. Rust emits f64::NAN for an empty
+      // ring, which serde serializes to JSON `null`; `isFinite(null)` is `true`
+      // (null coerces to 0), so the `!= null` guard is required — without it a
+      // null mean slips through and the band math `null + std` yields 0, spiking
+      // the confidence band to the top of the chart. (Matches the null guards on
+      // the sector table and the HU color scale below.)
       const valid = distances.map((d, i) => ({ d, m: meanHu[i], s: stdHu[i] }))
-        .filter(v => isFinite(v.m));
+        .filter(v => v.m != null && isFinite(v.m));
       if (valid.length === 0) continue;
 
       const vd = valid.map(v => v.d);

@@ -41,14 +41,15 @@ pub struct RadialAngularParams {
 impl Default for RadialAngularParams {
     fn default() -> Self {
         Self {
-            // Dense angular + radial sampling (5° steps, 0.25 mm rings) so the
-            // surface mesh reads as a smooth term-structure rather than a coarse
-            // 16×20 lattice. Per-voxel GLS noise is removed by the smoothing
-            // pass in the viewer, not by the sampling density — this just gives
-            // that pass a fine grid to work on. ~72×40 trilinear lookups per
-            // section is still sub-millisecond.
-            n_theta: 72,
-            radial_step_mm: 0.25,
+            // Moderately dense sampling (7.5° steps, 0.4 mm rings → ~48×25) so
+            // the surface reads as a smooth term-structure rather than the coarse
+            // 16×20 lattice, without paying for the 72×40 grid most of whose
+            // detail the viewer's smoother erased anyway. The viewer denoises in
+            // PHYSICAL units (mostly angular, to preserve the thin radial
+            // fat↔muscle boundary), so it works from whatever grid this provides
+            // and does not depend on a specific cell count.
+            n_theta: 48,
+            radial_step_mm: 0.4,
             // 10 mm outward from the lumen wall covers the pericoronary
             // fat band (typically < 6 mm) plus a margin for context.
             max_radius_mm: 10.0,
