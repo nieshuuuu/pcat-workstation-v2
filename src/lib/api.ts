@@ -257,6 +257,17 @@ export type MmdSummary = {
   mean_lipid_frac: number;
 };
 
+/** Build (and cache in backend state) the CPR frame for a centerline.
+ *  `centerlineMmZyx` must already be in patient [z, y, x] mm order. Call this
+ *  before generateAnnotationTargets so the cross-sections + ostium offset are
+ *  resolved against the current centerline, not a stale frame. */
+export async function buildCprFrame(
+  centerlineMmZyx: [number, number, number][],
+  pixelsWide: number = 768,
+): Promise<void> {
+  return invoke<void>('build_cpr_frame', { centerlineMm: centerlineMmZyx, pixelsWide });
+}
+
 /** Generate annotation targets for all cross-section frames along a centerline.
  *
  * `ostiumMm` (optional, in `[z, y, x]` pipeline order) shifts the first

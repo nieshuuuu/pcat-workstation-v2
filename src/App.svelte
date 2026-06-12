@@ -53,6 +53,18 @@
     getRecentDicoms().then((paths) => { recentPaths = paths; }).catch(() => {});
   });
 
+  // Clear stale FAI/pipeline results (and their overlay) when the centerline is
+  // removed — deleting seeds, Escape, or switching patient. Without this the FAI
+  // heatmap lingers on screen after the centerline it was computed from is gone.
+  $effect(() => {
+    const hasCenterline = Object.values(seedStore.vessels).some(
+      (v) => v.centerline !== null && v.centerline.length >= 2,
+    );
+    if (!hasCenterline && pipelineStore.results !== null) {
+      pipelineStore.reset();
+    }
+  });
+
   // ---- Keyboard shortcuts ----
   function handleKeydown(event: KeyboardEvent) {
     // Ignore if user is typing in an input/textarea

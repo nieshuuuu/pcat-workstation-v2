@@ -49,11 +49,12 @@
   // FAI overlay toggle
   let showFaiOverlay = $state(false);
 
-  // Auto-enable FAI overlay when analysis completes
+  // Track the FAI overlay to the pipeline status: auto-enable when analysis
+  // completes, and auto-hide when it's reset/cleared (e.g. centerline deleted).
+  // The effect only re-runs on a status change, so a manual toggle while
+  // 'complete' is preserved.
   $effect(() => {
-    if (pipelineStore.status === 'complete') {
-      showFaiOverlay = true;
-    }
+    showFaiOverlay = pipelineStore.status === 'complete';
   });
 
   // Needle B position as fraction (0..1); A and C are offset

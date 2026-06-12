@@ -22,6 +22,7 @@
     type CrossSectionSurface,
     type MmdSummary,
     generateAnnotationTargets,
+    buildCprFrame,
     sampleSurfaces,
     runMmdOnRoi,
     saveAnnotations,
@@ -118,9 +119,37 @@
     loadTargets();
   });
 
+  /** Downsample a polyline to at most `maxPts` evenly-spaced points (matches
+   *  CprView's frame build so both views produce an identical CPR frame). */
+  function downsample(
+    pts: [number, number, number][],
+    maxPts: number,
+  ): [number, number, number][] {
+    if (pts.length <= maxPts) return pts;
+    const step = (pts.length - 1) / (maxPts - 1);
+    const result: [number, number, number][] = [];
+    for (let i = 0; i < maxPts - 1; i++) result.push(pts[Math.round(i * step)]);
+    result.push(pts[pts.length - 1]);
+    return result;
+  }
+
   async function loadTargets() {
     loadingTargets = true;
     try {
+      // Rebuild the CPR frame from the CURRENT centerline first, so the
+      // cross-sections AND the ostium offset are resolved against it rather than
+      // a stale frame left over from a previous centerline (the cause of MMD
+      // starting at point 0). Mirror CprView exactly: downsample to 100 points,
+      // convert [x,y,z] (cornerstone) → [z,y,x] (patient), pixelsWide 768.
+      const centerlineZyx = downsample(centerlineMm, 100).map(
+        ([x, y, z]) => [z, y, x] as [number, number, number],
+      );
+      try {
+        await buildCprFrame(centerlineZyx, 768);
+      } catch (err) {
+        console.warn('Failed to rebuild CPR frame for MMD:', err);
+      }
+
       // Prefer the user-placed ostium marker over the first centerline waypoint
       // so MMD cross-sections start at the true coronary ostium (matches FAI).
       // seedStore returns [x, y, z] (cornerstone world); Rust pipeline expects
@@ -152,6 +181,14 @@
         }
         snakePoints = initSnake;
         statusMap = initStatus;
+
+        // Auto-run so the cross-section heatmap + surface appear immediately,
+        // reusing the whole-volume Water/Lipid calibration if it exists (no
+        // manual click, no expensive re-calibration). The cross-section overlay
+        // is computed from the same calibration, so the two views align.
+        if (Object.keys(initSnake).length > 0) {
+          handleRunMmd();
+        }
       } catch (err) {
         console.warn('Auto-adopt vessel wall failed:', err);
       }
