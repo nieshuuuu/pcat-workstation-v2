@@ -418,6 +418,16 @@ pub async fn load_series(
     state: State<'_, Mutex<AppState>>,
 ) -> Result<Response, String> {
     push_recent(&app, &dir);
+
+    // A single-series open is NOT a dual-energy pair. Drop any stale
+    // `dual_energy` + `wl_calibration` from a previous load so water/lipid can't
+    // silently run on a different series' data (it needs two energies).
+    {
+        let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
+        guard.dual_energy = None;
+        guard.wl_calibration = None;
+    }
+
     let dir_path = PathBuf::from(dir);
     let cache_key = (dir_path.to_string_lossy().into_owned(), uid.clone());
 
@@ -625,6 +635,7 @@ pub async fn load_dual_energy(
     {
         let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
         guard.dual_energy = Some(de);
+        guard.wl_calibration = None; // new pair → discard any prior calibration
     }
 
     let _ = app.emit("dicom_load_progress", ProgressEvent {
@@ -923,6 +934,15 @@ pub async fn load_patient_all(
     }
 
     push_recent(&app, &patient_dir);
+
+    // Fresh patient — drop the previous patient's dual-energy pair + calibration.
+    // If this patient has a keV pair it's re-established below; if not,
+    // `dual_energy` correctly stays None (water/lipid will refuse to run).
+    {
+        let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
+        guard.dual_energy = None;
+        guard.wl_calibration = None;
+    }
 
     let total = subdirs.len();
     let mut descriptors: Vec<LoadedSeriesDescriptor> = Vec::new();
