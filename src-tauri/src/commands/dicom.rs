@@ -1098,17 +1098,51 @@ pub async fn set_active_volume(
     uid: String,
     state: State<'_, Mutex<AppState>>,
 ) -> Result<Response, String> {
-    let key = (dir, uid);
-    let (metadata, voxels) = {
+    let key = (dir.clone(), uid.clone());
+
+    // Fast path: the series is already decoded + cached.
+    let cached_hit = {
         let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
-        let cached = guard
-            .volume_cache
-            .get(&key)
-            .ok_or_else(|| "volume not in cache — load it first".to_string())?;
-        guard.volume = Some(cached.volume.clone());
-        guard.current_volume_key = Some(key.clone());
-        guard.last_metadata = Some(cached.metadata.clone());
-        (cached.metadata.clone(), Arc::clone(&cached.voxels_i16))
+        if let Some(cached) = guard.volume_cache.get(&key) {
+            guard.volume = Some(cached.volume.clone());
+            guard.current_volume_key = Some(key.clone());
+            guard.last_metadata = Some(cached.metadata.clone());
+            Some((cached.metadata.clone(), Arc::clone(&cached.voxels_i16)))
+        } else {
+            None
+        }
+    };
+
+    let (metadata, voxels) = match cached_hit {
+        Some(hit) => hit,
+        None => {
+            // Lazy decode-on-demand: `load_patient_all` scans every series but
+            // only decodes the ones needed up front (active + dual-energy pair).
+            // Switching to any other series decodes it here on first access,
+            // then it stays cached. This is what keeps the initial load fast.
+            let vol = dicom_load::load_series(Path::new(&dir), &uid, None)
+                .await
+                .map_err(|e| format!("decode failed: {e}"))?;
+            bridge_into_state(&vol, &state)?;
+            let meta = vol.metadata.clone();
+            let voxels_arc: Arc<Vec<i16>> = Arc::new(vol.voxels_i16);
+            let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
+            guard.current_volume_key = Some(key.clone());
+            guard.last_metadata = Some(meta.clone());
+            let cached_volume = guard
+                .volume
+                .clone()
+                .expect("bridge_into_state populated state.volume");
+            guard.volume_cache.insert(
+                key.clone(),
+                CachedVolume {
+                    metadata: meta.clone(),
+                    voxels_i16: Arc::clone(&voxels_arc),
+                    volume: cached_volume,
+                },
+            );
+            (meta, voxels_arc)
+        }
     };
 
     let voxel_bytes: Vec<u8> = bytemuck::cast_slice(&voxels[..]).to_vec();
