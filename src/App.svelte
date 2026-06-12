@@ -378,34 +378,39 @@
       volumeStore.setLoadProgress(0);
       volumeStore.setLoadMessage('');
 
-      // Smooth 0-95% progress by combining coarse per-series index (from
-      // "patient_series" events) with fine per-slice decode progress (from
-      // "decoding" events emitted during each series' decode callback).
+      // Two-phase lazy load: header SCAN of all series (first 15%), then DECODE
+      // of the active + dual-energy series (15-95%, the long leg). buildVolume
+      // carries it to 100% afterward. Decode progress = coarse per-series index
+      // ("patient_series") + fine per-slice ("decoding").
+      const SCAN_PCT = 15;
+      const DECODE_END = 95;
       let seriesIdx = 0;
       let seriesTotal = 0;
       const scaleToOuter = (withinSeries: number): number => {
-        if (seriesTotal === 0) return 0;
-        const base = (seriesIdx / seriesTotal) * 95;
-        const span = (1 / seriesTotal) * 95;
-        return Math.min(95, Math.round(base + withinSeries * span));
+        if (seriesTotal === 0) return SCAN_PCT;
+        const span = (DECODE_END - SCAN_PCT) / seriesTotal;
+        return Math.min(DECODE_END, Math.round(SCAN_PCT + seriesIdx * span + withinSeries * span));
       };
 
       unlistenProgress = await onDicomLoadProgress((p) => {
-        if (p.phase === 'patient_series' && p.total > 0) {
-          // New series starting — record its index and name for the label.
+        if (p.phase === 'scanning' && p.total > 0) {
+          volumeStore.setLoadProgress(Math.round((p.done / p.total) * SCAN_PCT));
+          if (p.detail) {
+            volumeStore.setLoadMessage(`Scanning ${p.done + 1}/${p.total}: ${p.detail}`);
+          }
+        } else if (p.phase === 'patient_series' && p.total > 0) {
+          // A needed series is starting to decode.
           seriesIdx = p.done;
           seriesTotal = p.total;
           if (p.detail) {
-            volumeStore.setLoadMessage(
-              `Loading ${p.done + 1}/${p.total}: ${p.detail}`,
-            );
+            volumeStore.setLoadMessage(`Decoding ${p.done + 1}/${p.total}: ${p.detail}`);
           }
           volumeStore.setLoadProgress(scaleToOuter(0));
         } else if (p.phase === 'decoding' && p.total > 0 && seriesTotal > 0) {
           // Fine-grained slice decode within the current series.
           volumeStore.setLoadProgress(scaleToOuter(p.done / p.total));
         } else if (p.phase === 'done') {
-          volumeStore.setLoadProgress(95);
+          volumeStore.setLoadProgress(DECODE_END);
           volumeStore.setLoadMessage('Finalizing');
         }
       });

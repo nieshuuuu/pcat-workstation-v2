@@ -682,13 +682,70 @@ fn build_dual_energy_volume(
     high_kev: f64,
 ) -> Result<pcat_pipeline::dicom_loader::DualEnergyVolume, String> {
     let m = &low.metadata;
-    let nz = m.num_slices;
+    let hm = &high.metadata;
     let ny = m.rows as usize;
     let nx = m.cols as usize;
-    let shape = (nz, ny, nx);
+    if hm.rows as usize != ny || hm.cols as usize != nx {
+        return Err(format!(
+            "in-plane grids differ: {ny}×{nx} ({low_kev} keV) vs {}×{} ({high_kev} keV)",
+            hm.rows, hm.cols
+        ));
+    }
+    let slice_len = ny * nx;
 
-    let low_f32: Vec<f32> = low.voxels_i16.iter().map(|&v| v as f32).collect();
-    let high_f32: Vec<f32> = high.voxels_i16.iter().map(|&v| v as f32).collect();
+    // The two VMI reconstructions come from the same scan and share slice
+    // z-positions, but a recon can have a slice or two more/fewer at an end
+    // (e.g. 429 vs 428). Pair slices by z-position (nearest within tolerance) so
+    // the dual-energy volume is co-registered even when num_slices differs,
+    // rather than rejecting the pair outright.
+    const Z_TOL_MM: f64 = 0.10;
+    let lz = &m.slice_positions_z;
+    let hz = &hm.slice_positions_z;
+    if lz.len() != m.num_slices || hz.len() != hm.num_slices {
+        return Err("slice_positions_z length mismatch — cannot align dual-energy".into());
+    }
+    let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(lz.len().min(hz.len()));
+    let mut used_high = vec![false; hz.len()];
+    for (li, &z) in lz.iter().enumerate() {
+        let mut best: Option<(usize, f64)> = None;
+        for (hj, &hzj) in hz.iter().enumerate() {
+            if used_high[hj] {
+                continue;
+            }
+            let d = (hzj - z).abs();
+            if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((hj, d));
+            }
+        }
+        if let Some((hj, d)) = best {
+            if d <= Z_TOL_MM {
+                used_high[hj] = true;
+                pairs.push((li, hj));
+            }
+        }
+    }
+    if pairs.len() < 2 {
+        return Err(format!(
+            "z-overlap too small: {} common slices ({low_kev} keV has {}, {high_kev} keV has {})",
+            pairs.len(),
+            lz.len(),
+            hz.len()
+        ));
+    }
+
+    let nz = pairs.len();
+    let shape = (nz, ny, nx);
+    let mut low_f32 = vec![0f32; nz * slice_len];
+    let mut high_f32 = vec![0f32; nz * slice_len];
+    for (out_k, &(li, hj)) in pairs.iter().enumerate() {
+        let lo = &low.voxels_i16[li * slice_len..(li + 1) * slice_len];
+        let hi = &high.voxels_i16[hj * slice_len..(hj + 1) * slice_len];
+        let dst = out_k * slice_len;
+        for t in 0..slice_len {
+            low_f32[dst + t] = lo[t] as f32;
+            high_f32[dst + t] = hi[t] as f32;
+        }
+    }
     let low_arr = Array3::from_shape_vec(shape, low_f32)
         .map_err(|e| format!("low shape: {e}"))?;
     let high_arr = Array3::from_shape_vec(shape, high_f32)
@@ -710,9 +767,11 @@ fn build_dual_energy_volume(
     let spacing = [m.slice_spacing, m.pixel_spacing[0], m.pixel_spacing[1]];
     // ZYX order; the LPS x/y components were silently dropped before, which
     // miscomputed voxel indices for any acquisition not centered at isocenter.
+    // Z is the first MATCHED slice (the built volume starts there, not at the
+    // low series' first slice which may have been trimmed by the z-alignment).
     let ipp = m.image_position_patient;
     let origin = [
-        m.slice_positions_z.first().copied().unwrap_or(ipp[2]),
+        lz.get(pairs[0].0).copied().unwrap_or(ipp[2]),
         ipp[1],
         ipp[0],
     ];
@@ -881,7 +940,7 @@ pub async fn load_patient_all(
         let _ = app.emit(
             "dicom_load_progress",
             ProgressEvent {
-                phase: "patient_series",
+                phase: "scanning",
                 done: i,
                 total,
                 detail: Some(name.clone()),
@@ -968,7 +1027,19 @@ pub async fn load_patient_all(
     need.dedup();
 
     let decode_started = std::time::Instant::now();
-    for &idx in &need {
+    let n_need = need.len();
+    for (k, &idx) in need.iter().enumerate() {
+        // Coarse per-series progress for the decode phase (the long leg).
+        let _ = app.emit(
+            "dicom_load_progress",
+            ProgressEvent {
+                phase: "patient_series",
+                done: k,
+                total: n_need,
+                detail: Some(descriptors[idx].name.clone()),
+            },
+        );
+
         let cache_key = (descriptors[idx].path.clone(), descriptors[idx].uid.clone());
         let already_cached = {
             let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
@@ -1085,33 +1156,24 @@ pub async fn load_patient_all(
         let low_vol = PipelineLoadedVolume { metadata: low_meta, voxels_i16: (*low_voxels).clone() };
         let high_vol = PipelineLoadedVolume { metadata: high_meta, voxels_i16: (*high_voxels).clone() };
 
-        if low_vol.metadata.rows == high_vol.metadata.rows
-            && low_vol.metadata.cols == high_vol.metadata.cols
-            && low_vol.metadata.num_slices == high_vol.metadata.num_slices
-        {
-            match build_dual_energy_volume(&low_vol, &high_vol, low_kev, high_kev) {
-                Ok(de) => {
-                    let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
-                    guard.dual_energy = Some(de);
-                }
-                Err(e) => {
-                    failures.push(format!("dual-energy pairing failed: {e}"));
+        // build_dual_energy_volume checks the in-plane grid and aligns the two
+        // series by slice z-position, so a num_slices difference (e.g. 429 vs
+        // 428 from different VMI recons) is handled rather than rejected.
+        match build_dual_energy_volume(&low_vol, &high_vol, low_kev, high_kev) {
+            Ok(de) => {
+                let n = de.low.shape()[0];
+                let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
+                guard.dual_energy = Some(de);
+                if low_vol.metadata.num_slices != high_vol.metadata.num_slices {
+                    eprintln!(
+                        "[dual-energy] paired {} keV ({} slices) + {} keV ({} slices) on {} common z-positions",
+                        low_kev, low_vol.metadata.num_slices, high_kev, high_vol.metadata.num_slices, n
+                    );
                 }
             }
-        } else {
-            // Show the actual dims so a mismatch (e.g. a flaky SMB scan dropping
-            // slices from one series → different num_slices) is diagnosable.
-            failures.push(format!(
-                "dual-energy pairing skipped: keV grids differ — {} keV {}×{}×{} vs {} keV {}×{}×{}",
-                low_kev,
-                low_vol.metadata.rows,
-                low_vol.metadata.cols,
-                low_vol.metadata.num_slices,
-                high_kev,
-                high_vol.metadata.rows,
-                high_vol.metadata.cols,
-                high_vol.metadata.num_slices,
-            ));
+            Err(e) => {
+                failures.push(format!("dual-energy pairing skipped: {e}"));
+            }
         }
     }
 
@@ -1184,4 +1246,68 @@ pub async fn set_active_volume(
     let voxel_bytes: Vec<u8> = bytemuck::cast_slice(&voxels[..]).to_vec();
     let framed = encode_frame(&metadata, &voxel_bytes)?;
     Ok(Response::new(framed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal single-column volume: `z_positions.len()` slices, in-plane
+    /// `rows×cols`, every voxel = `fill`.
+    fn make_vol(z_positions: &[f64], rows: u32, cols: u32, fill: i16) -> PipelineLoadedVolume {
+        let n = z_positions.len();
+        let slice_len = (rows as usize) * (cols as usize);
+        PipelineLoadedVolume {
+            metadata: PipelineVolumeMetadata {
+                series_uid: "uid".into(),
+                series_description: "desc".into(),
+                image_comments: None,
+                rows,
+                cols,
+                num_slices: n,
+                pixel_spacing: [1.0, 1.0],
+                slice_spacing: 1.0,
+                orientation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                window_center: 40.0,
+                window_width: 400.0,
+                patient_name: "p".into(),
+                study_description: "s".into(),
+                slice_positions_z: z_positions.to_vec(),
+                image_position_patient: [0.0, 0.0, z_positions.first().copied().unwrap_or(0.0)],
+            },
+            voxels_i16: vec![fill; n * slice_len],
+        }
+    }
+
+    #[test]
+    fn dual_energy_aligns_mismatched_slice_counts() {
+        // 70 keV has 4 slices (z=0,1,2,3); 150 keV has 3 (z=0,1,2) — like the
+        // real 429-vs-428 case. Pairing on z keeps the 3 common slices.
+        let low = make_vol(&[0.0, 1.0, 2.0, 3.0], 1, 1, 70);
+        let high = make_vol(&[0.0, 1.0, 2.0], 1, 1, 150);
+        let de = build_dual_energy_volume(&low, &high, 70.0, 150.0)
+            .expect("should pair on common z-positions");
+        assert_eq!(de.low.shape(), &[3, 1, 1], "keeps the 3 common slices");
+        assert_eq!(de.high.shape(), &[3, 1, 1]);
+        assert!(de.low.iter().all(|&v| v == 70.0), "low co-registered");
+        assert!(de.high.iter().all(|&v| v == 150.0), "high co-registered");
+        assert!((de.origin[0] - 0.0).abs() < 1e-9, "origin z = first matched slice");
+    }
+
+    #[test]
+    fn dual_energy_rejects_different_inplane_grid() {
+        let low = make_vol(&[0.0, 1.0], 1, 2, 70); // 1×2 in-plane
+        let high = make_vol(&[0.0, 1.0], 1, 1, 150); // 1×1 in-plane
+        assert!(
+            build_dual_energy_volume(&low, &high, 70.0, 150.0).is_err(),
+            "different in-plane grids must be rejected"
+        );
+    }
+
+    #[test]
+    fn dual_energy_errors_when_no_z_overlap() {
+        let low = make_vol(&[0.0, 1.0], 1, 1, 70);
+        let high = make_vol(&[100.0, 101.0], 1, 1, 150); // no shared z
+        assert!(build_dual_energy_volume(&low, &high, 70.0, 150.0).is_err());
+    }
 }
