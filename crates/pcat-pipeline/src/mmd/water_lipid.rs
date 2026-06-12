@@ -425,10 +425,13 @@ pub fn decompose_slice(
 
 /// Decompose the masked voxels of a whole volume into water/lipid fractions by
 /// GLS, packed into the shared `MmdResult` so the existing pericoronary ROI
-/// tool (overlay, surface plot, CSV) renders f_w/f_l directly. `f_w` is NOT
-/// clamped — muscle/fibrous voxels read f_w > 1 (the binary model's
-/// contamination signature). The drawn ROI is the selection, so the soft-tissue
-/// gate is NOT applied here. Unmasked voxels are zero.
+/// tool (overlay, surface plot, CSV) renders f_w/f_l directly. The soft-tissue
+/// gate IS applied (same as `decompose_slice` / the whole-volume view): voxels
+/// outside the HU gate — gas/lung/iodine-blood/calcium/bone — are `NaN` so they
+/// drop out of the surface plot and stats instead of reading f_w ≫ 1 / f_l ≪ 0.
+/// Within the gate `f_w` is NOT clamped (muscle/fibrous still read f_w > 1, the
+/// binary model's contamination signature). Unmasked voxels (outside the ROI)
+/// are zero.
 pub fn decompose_volume_gls(
     low_energy: &Array3<f32>,
     high_energy: &Array3<f32>,
@@ -456,10 +459,14 @@ pub fn decompose_volume_gls(
         .zip(mk.par_iter())
         .map(|((&l, &h), &m)| {
             if !m {
-                return [0.0; 5];
+                return [0.0; 5]; // outside the ROI mask
             }
-            let sigma = sigma_cov(l as f64, h as f64, calib.ab_low, calib.ab_high, calib.rho);
-            let (fw, _sf) = gls_fw([l as f64, h as f64], calib.hu_w, hu_l, sigma);
+            let l64 = l as f64;
+            if l64 < calib.gate[0] || l64 > calib.gate[1] {
+                return [f32::NAN; 5]; // gated out (not a water/lipid mixture)
+            }
+            let sigma = sigma_cov(l64, h as f64, calib.ab_low, calib.ab_high, calib.rho);
+            let (fw, _sf) = gls_fw([l64, h as f64], calib.hu_w, hu_l, sigma);
             let fw = fw as f32;
             let fl = 1.0 - fw;
             [fw, fl, fw * rho_w, fl * rho_l, fw * rho_w + fl * rho_l]

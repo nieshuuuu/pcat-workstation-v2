@@ -6,5 +6,5 @@
 //! `Material` LAC machinery lived here for the 3-material direct/PWSQS solvers,
 //! which were dropped (ill-conditioned at soft-tissue contrast).
 
-pub(crate) const DENSITY_WATER: f64 = 1.000;
-pub(crate) const DENSITY_LIPID: f64 = 0.950;
+pub const DENSITY_WATER: f64 = 1.000;
+pub const DENSITY_LIPID: f64 = 0.950;

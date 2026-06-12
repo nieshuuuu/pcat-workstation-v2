@@ -600,17 +600,20 @@ pub async fn run_mmd_on_roi(
         let wf_slice = result.water_frac.as_slice().unwrap();
         let lf_slice = result.lipid_frac.as_slice().unwrap();
 
+        // Mean over the gated (finite) in-mask voxels — gated-out voxels are NaN
+        // and must be excluded so the mean isn't poisoned to NaN.
         let mut sum_w = 0.0_f64;
         let mut sum_l = 0.0_f64;
-
+        let mut n_finite = 0usize;
         for idx in 0..mask_slice.len() {
-            if mask_slice[idx] {
+            if mask_slice[idx] && wf_slice[idx].is_finite() {
                 sum_w += wf_slice[idx] as f64;
                 sum_l += lf_slice[idx] as f64;
+                n_finite += 1;
             }
         }
 
-        let n = n_voxels as f64;
+        let n = n_finite.max(1) as f64;
         let summary = MmdSummary {
             method: method_clone,
             iterations: result.iterations,
@@ -754,10 +757,29 @@ pub async fn sample_surfaces(
 // MMD overlay for a single cross-section
 // ---------------------------------------------------------------------------
 
-/// Get the current MMD result for a specific material as a flat array for overlay rendering.
-///
-/// Extracts the material values for the cross-section slice at the given target,
-/// for rendering as a colormap overlay in the editor.
+/// Map a per-voxel (f_w, σ_f) GLS result to the requested material/unit value.
+/// NaN (gated) propagates so the UI falls back to CT for those pixels.
+fn wl_overlay_value(fw: f32, sf: f32, material: &str, unit: &str) -> f32 {
+    let rho_w = (pcat_pipeline::mmd::DENSITY_WATER * 1000.0) as f32;
+    let rho_l = (pcat_pipeline::mmd::DENSITY_LIPID * 1000.0) as f32;
+    let fl = 1.0 - fw;
+    match (material, unit) {
+        ("water", "mass") => fw * rho_w,
+        ("lipid", "fraction") => fl,
+        ("lipid", "mass") => fl * rho_l,
+        ("density", _) => fw * rho_w + fl * rho_l,
+        ("sigma", _) | ("sf", _) => sf,
+        // ("water", "fraction") and any default → water fraction
+        _ => fw,
+    }
+}
+
+/// Decompose the full CPR cross-section at `target_index` into a material
+/// overlay, computed directly from the self-measured water/lipid calibration
+/// (per-pixel GLS, soft-tissue gated) — the same estimator as the whole-volume
+/// Water/Lipid view, so the cross-section heatmap aligns with it and covers all
+/// soft tissue (not just the ROI ring). Returns a flat `pixels×pixels` array
+/// with `NaN` for gated-out pixels (the UI renders those as plain CT).
 #[tauri::command]
 pub async fn get_mmd_overlay(
     target_index: usize,
@@ -765,100 +787,87 @@ pub async fn get_mmd_overlay(
     unit: String,
     state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<Vec<f32>, String> {
-    let guard = state.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+    // Pull geometry, the dual-energy volumes, and the calibration under the lock.
+    let (low, high, spacing, origin, direction, pos_mm, normal, binormal, pixels, width_mm, calib) = {
+        let guard = state.lock().map_err(|e| format!("lock poisoned: {e}"))?;
 
-    let mmd_result = guard
-        .mmd_result
-        .as_ref()
-        .ok_or_else(|| "no MMD result — run decomposition first".to_string())?;
+        let calib = guard
+            .wl_calibration
+            .clone()
+            .ok_or_else(|| "no water/lipid calibration — run the decomposition first".to_string())?;
 
-    let material_map = select_material_array(mmd_result, &material, &unit)?;
+        let targets = guard
+            .annotation_targets
+            .as_ref()
+            .ok_or_else(|| "no annotation targets generated".to_string())?;
+        let target = targets
+            .get(target_index)
+            .ok_or_else(|| format!("target_index {target_index} out of range (0..{})", targets.len()))?;
 
-    let targets = guard
-        .annotation_targets
-        .as_ref()
-        .ok_or_else(|| "no annotation targets generated".to_string())?;
+        let frame = guard
+            .cpr_frame
+            .as_ref()
+            .ok_or_else(|| "no CPR frame built".to_string())?;
 
-    let target = targets
-        .get(target_index)
-        .ok_or_else(|| format!("target_index {target_index} out of range (0..{})", targets.len()))?;
+        // Geometry comes from the dual-energy grid (the GLS solver runs against
+        // de.low/de.high), not the currently-displayed series.
+        let de = guard
+            .dual_energy
+            .as_ref()
+            .ok_or_else(|| "no dual-energy volume loaded".to_string())?;
 
-    let frame = guard
-        .cpr_frame
-        .as_ref()
-        .ok_or_else(|| "no CPR frame built".to_string())?;
-
-    // Overlay samples the MMD material map, which lives in the dual-energy
-    // grid — pull geometry from state.dual_energy, not state.volume (the
-    // currently-displayed series may be a different volume entirely).
-    let de = guard
-        .dual_energy
-        .as_ref()
-        .ok_or_else(|| "no dual-energy volume loaded".to_string())?;
-
-    let spacing = de.spacing;
-    let origin = de.origin;
-    let direction = de.direction;
-
-    let frame_idx = target.frame_index;
-    if frame_idx >= frame.n_cols() {
-        return Err(format!("frame_index {frame_idx} out of range"));
-    }
-
-    let pos_mm = frame.positions[frame_idx];
-    let normal = frame.normals[frame_idx];
-    let binormal = frame.binormals[frame_idx];
-
-    let pixels = target.pixels;
-    let width_mm = target.width_mm;
-    let inv_spacing = [1.0 / spacing[0], 1.0 / spacing[1], 1.0 / spacing[2]];
-
-    let mut overlay = vec![f32::NAN; pixels * pixels];
-
-    for row in 0..pixels {
-        for col in 0..pixels {
-            // Convert pixel (row, col) to offset in mm from center.
-            // Row direction: row=0 -> +normal, row=pixels-1 -> -normal
-            let offset_n = width_mm * (1.0 - 2.0 * row as f64 / (pixels as f64 - 1.0));
-            // Col direction: col=0 -> +binormal, col=pixels-1 -> -binormal
-            let offset_b = width_mm * (1.0 - 2.0 * col as f64 / (pixels as f64 - 1.0));
-
-            let wz = pos_mm[0] + offset_n * normal[0] + offset_b * binormal[0];
-            let wy = pos_mm[1] + offset_n * normal[1] + offset_b * binormal[1];
-            let wx = pos_mm[2] + offset_n * normal[2] + offset_b * binormal[2];
-
-            // Convert world coords to voxel indices (IOP-aware).
-            let [vz, vy, vx] = pcat_pipeline::types::patient_to_voxel(
-                [wz, wy, wx],
-                origin,
-                inv_spacing,
-                &direction,
-            );
-
-            // Only voxels inside the ROI mask have meaningful material
-            // fractions (solver only runs there). Elsewhere the backing
-            // array is zero — return NaN so the UI can fall back to CT.
-            let mask_shape = mmd_result.mask.shape();
-            let zi = vz.round() as i64;
-            let yi = vy.round() as i64;
-            let xi = vx.round() as i64;
-            let inside_volume = zi >= 0
-                && yi >= 0
-                && xi >= 0
-                && (zi as usize) < mask_shape[0]
-                && (yi as usize) < mask_shape[1]
-                && (xi as usize) < mask_shape[2];
-            let inside_mask = inside_volume
-                && mmd_result.mask[[zi as usize, yi as usize, xi as usize]];
-            if !inside_mask {
-                overlay[row * pixels + col] = f32::NAN;
-                continue;
-            }
-
-            let val = pcat_pipeline::interp::trilinear(material_map, vz, vy, vx);
-            overlay[row * pixels + col] = val;
+        let frame_idx = target.frame_index;
+        if frame_idx >= frame.n_cols() {
+            return Err(format!("frame_index {frame_idx} out of range"));
         }
-    }
+
+        (
+            Arc::clone(&de.low),
+            Arc::clone(&de.high),
+            de.spacing,
+            de.origin,
+            de.direction,
+            frame.positions[frame_idx],
+            frame.normals[frame_idx],
+            frame.binormals[frame_idx],
+            target.pixels,
+            target.width_mm,
+            calib,
+        )
+    };
+
+    let material_c = material.clone();
+    let overlay = tokio::task::spawn_blocking(move || {
+        let inv_spacing = [1.0 / spacing[0], 1.0 / spacing[1], 1.0 / spacing[2]];
+        let n = pixels * pixels;
+
+        // Sample the low/high VMI at each cross-section pixel (trilinear).
+        let mut low_cs = vec![0.0f32; n];
+        let mut high_cs = vec![0.0f32; n];
+        for row in 0..pixels {
+            for col in 0..pixels {
+                let offset_n = width_mm * (1.0 - 2.0 * row as f64 / (pixels as f64 - 1.0));
+                let offset_b = width_mm * (1.0 - 2.0 * col as f64 / (pixels as f64 - 1.0));
+                let wz = pos_mm[0] + offset_n * normal[0] + offset_b * binormal[0];
+                let wy = pos_mm[1] + offset_n * normal[1] + offset_b * binormal[1];
+                let wx = pos_mm[2] + offset_n * normal[2] + offset_b * binormal[2];
+                let [vz, vy, vx] =
+                    pcat_pipeline::types::patient_to_voxel([wz, wy, wx], origin, inv_spacing, &direction);
+                let idx = row * pixels + col;
+                low_cs[idx] = pcat_pipeline::interp::trilinear(&low, vz, vy, vx);
+                high_cs[idx] = pcat_pipeline::interp::trilinear(&high, vz, vy, vx);
+            }
+        }
+
+        // GLS-decompose the cross-section (gated, theoretical anchor — matches
+        // the Water/Lipid view and run_mmd_on_roi).
+        let (fw, sf) = mmd::decompose_slice(&low_cs, &high_cs, &calib, WlAnchor::Theoretical);
+        (0..n)
+            .map(|i| wl_overlay_value(fw[i], sf[i], &material_c, &unit))
+            .collect::<Vec<f32>>()
+    })
+    .await
+    .map_err(|e| format!("get_mmd_overlay task failed: {e}"))?;
 
     Ok(overlay)
 }
