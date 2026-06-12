@@ -46,7 +46,9 @@
   let fetchSeq = 0;
 
   let canvasEl: HTMLCanvasElement | undefined = $state();
-  let hover = $state<{ x: number; y: number; hu: number; fw: number; sf: number } | null>(null);
+  // x,y = voxel coords; cx,cy = cursor position within the canvas pane (for the
+  // floating tooltip). fw/sf are the estimate + its standard deviation at (x,y).
+  let hover = $state<{ x: number; y: number; hu: number; fw: number; sf: number; cx: number; cy: number } | null>(null);
 
   // CT window matching the reference figure's grayscale underlay.
   const CT_LO = -160;
@@ -238,7 +240,18 @@
       return;
     }
     const i = py * s.nx + px;
-    hover = { x: px, y: py, hu: s.ct[i], fw: s.fw[i], sf: s.sf[i] };
+    // Position the tooltip relative to the canvas pane so it follows the cursor.
+    const pane = canvas.parentElement;
+    const prect = pane ? pane.getBoundingClientRect() : rect;
+    hover = {
+      x: px,
+      y: py,
+      hu: s.ct[i],
+      fw: s.fw[i],
+      sf: s.sf[i],
+      cx: e.clientX - prect.left,
+      cy: e.clientY - prect.top,
+    };
   }
 
   /* ── Colorbar helpers ───────────────────────────────────── */
@@ -316,11 +329,20 @@
           z = {z} / {nz - 1}
         </div>
 
-        <!-- Hover readout -->
+        <!-- Hover readout: floating tooltip at the cursor with the estimated
+             volume fractions ± standard deviation. -->
         {#if hover}
-          <div class="pointer-events-none absolute bottom-2 left-2 rounded bg-black/60 px-2 py-1 text-[10px] text-white tabular-nums">
-            ({hover.x}, {hover.y}) · HU {Math.round(hover.hu)} ·
-            f_w {fmt(hover.fw, 2)} · f_l {fmt(1 - hover.fw, 2)} · σ_f {fmt(hover.sf, 3)}
+          <div
+            class="pointer-events-none absolute z-10 rounded bg-black/75 px-2 py-1 text-[10px] leading-snug text-white tabular-nums shadow-lg"
+            style="left: {hover.cx + 14}px; top: {hover.cy + 14}px;"
+          >
+            {#if Number.isFinite(hover.fw)}
+              <div>f_w&nbsp;&nbsp;{fmt(hover.fw, 2)} ± {fmt(hover.sf, 2)}</div>
+              <div>f_l&nbsp;&nbsp;{fmt(1 - hover.fw, 2)} ± {fmt(hover.sf, 2)}</div>
+              <div class="text-white/55">HU {Math.round(hover.hu)} · ({hover.x}, {hover.y})</div>
+            {:else}
+              <div class="text-white/55">HU {Math.round(hover.hu)} · gated · ({hover.x}, {hover.y})</div>
+            {/if}
           </div>
         {/if}
       </div>
