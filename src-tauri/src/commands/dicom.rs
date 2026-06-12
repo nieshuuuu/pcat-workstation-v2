@@ -870,6 +870,7 @@ pub async fn load_patient_all(
     // Parallel to `descriptors` — the folder each series lives in, for lazy decode.
     let mut series_dirs: Vec<PathBuf> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
+    let scan_started = std::time::Instant::now();
 
     // Phase 1 — SCAN every series (header-only, fast, NO pixel decode) to build
     // the volume-switcher list. Decoding all series up front was the slow path
@@ -911,6 +912,11 @@ pub async fn load_patient_all(
         });
         series_dirs.push(series_dir);
     }
+    eprintln!(
+        "[load-timing] load_patient_all: scanned {} series (header-only) in {:.2?}",
+        descriptors.len(),
+        scan_started.elapsed()
+    );
 
     if descriptors.is_empty() {
         return Err(format!(
@@ -961,6 +967,7 @@ pub async fn load_patient_all(
     need.sort_unstable();
     need.dedup();
 
+    let decode_started = std::time::Instant::now();
     for &idx in &need {
         let cache_key = (descriptors[idx].path.clone(), descriptors[idx].uid.clone());
         let already_cached = {
@@ -1010,6 +1017,11 @@ pub async fn load_patient_all(
             );
         }
     }
+    eprintln!(
+        "[load-timing] load_patient_all: decoded {} needed series (active + dual-energy pair) in {:.2?}",
+        need.len(),
+        decode_started.elapsed()
+    );
 
     // Bridge the active one into state.volume (may already be there if it
     // was the last-loaded series; the cache-get-then-write is cheap).

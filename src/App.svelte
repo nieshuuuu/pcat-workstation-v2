@@ -410,14 +410,23 @@
         }
       });
 
+      const _t0 = performance.now();
       const result = await loadPatientAll(patientPath);
+      const _t1 = performance.now();
 
       // Hydrate cornerstone for the active series via the cache-hit path.
       const active = result.series[result.active_index];
       const { metadata, voxels } = await setActiveVolume(active.path, active.uid);
+      const _t2 = performance.now();
 
       const volumeKey = `${active.path}::${active.uid}`;
       const csId = buildVolume(volumeKey, metadata, voxels);
+      const _t3 = performance.now();
+      console.log(
+        `[load-timing] loadPatientAll(scan+decode)=${(_t1 - _t0) | 0}ms · ` +
+        `setActiveVolume(IPC ${(voxels.length * 2 / 1048576) | 0}MB)=${(_t2 - _t1) | 0}ms · ` +
+        `buildVolume(cornerstone)=${(_t3 - _t2) | 0}ms`,
+      );
 
       const direction = computeDirectionMatrix(metadata.orientation);
       const ipp = metadata.image_position_patient;
