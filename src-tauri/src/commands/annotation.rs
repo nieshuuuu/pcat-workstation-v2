@@ -8,7 +8,7 @@ use tauri::{Emitter, Manager};
 
 use pcat_pipeline::active_contour::{
     compute_gradient_field, evolve_snake as pipeline_evolve_snake, init_circular_contour,
-    insert_control_point, SnakeParams,
+    SnakeParams,
 };
 use pcat_pipeline::annotation::{self, AnnotationBatchParams, AnnotationTarget};
 use pcat_pipeline::cpr::CprFrame;
@@ -237,63 +237,6 @@ pub async fn evolve_snake(
     }
 
     Ok(result)
-}
-
-/// Replace the snake contour points for a cross-section (e.g. after user drag).
-///
-/// Also marks the contour as not finalized.
-#[tauri::command]
-pub async fn update_snake_points(
-    target_index: usize,
-    points: Vec<[f64; 2]>,
-    state: tauri::State<'_, Mutex<AppState>>,
-) -> Result<(), String> {
-    let mut guard = state.lock().map_err(|e| format!("lock poisoned: {e}"))?;
-
-    // Validate that annotation targets exist and index is in range.
-    let targets = guard
-        .annotation_targets
-        .as_ref()
-        .ok_or_else(|| "no annotation targets generated".to_string())?;
-
-    if target_index >= targets.len() {
-        return Err(format!(
-            "target_index {target_index} out of range (0..{})",
-            targets.len()
-        ));
-    }
-
-    guard.snake_contours.insert(target_index, points);
-    guard.finalized.insert(target_index, false);
-
-    Ok(())
-}
-
-/// Add a control point to the snake contour at the given position.
-///
-/// The point is inserted at the closest edge of the existing contour.
-/// Returns the index of the inserted point.
-#[tauri::command]
-pub async fn add_snake_point(
-    target_index: usize,
-    position: [f64; 2],
-    state: tauri::State<'_, Mutex<AppState>>,
-) -> Result<usize, String> {
-    let mut guard = state.lock().map_err(|e| format!("lock poisoned: {e}"))?;
-
-    let contour = guard
-        .snake_contours
-        .get_mut(&target_index)
-        .ok_or_else(|| {
-            format!("no snake initialized for target {target_index} — call init_snake first")
-        })?;
-
-    let idx = insert_control_point(contour, position);
-
-    // Mark as not finalized since the contour changed.
-    guard.finalized.insert(target_index, false);
-
-    Ok(idx)
 }
 
 /// Number of control points kept when adopting the auto-detected vessel wall

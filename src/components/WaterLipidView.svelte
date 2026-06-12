@@ -44,6 +44,12 @@
 
   /** Latest-wins guard so slider scrubbing doesn't render a stale slice. */
   let fetchSeq = 0;
+  /** Single-in-flight coalescing: at most one slice request is ever in flight.
+   *  If z/anchor change while one is running, we fetch exactly once more for
+   *  the latest value when it returns — so a fast drag issues a handful of
+   *  requests that converge on the final slice, not one IPC call per tick. */
+  let fetchInflight = false;
+  let fetchPending = false;
 
   let canvasEl: HTMLCanvasElement | undefined = $state();
   // x,y = voxel coords; cx,cy = cursor position within the canvas pane (for the
@@ -130,14 +136,28 @@
 
   async function fetchSlice() {
     if (!calib) return;
+    // Coalesce: never run two requests at once. Mark pending and return; the
+    // in-flight call re-fires for the latest z/anchor when it settles.
+    if (fetchInflight) {
+      fetchPending = true;
+      return;
+    }
+    fetchInflight = true;
     const seq = ++fetchSeq;
     try {
       const s = await getWlSlice(z, anchor);
-      if (seq !== fetchSeq) return; // a newer request superseded this one
-      slice = s;
-      sfCap = computeSfCap(s);
+      if (seq === fetchSeq) {
+        slice = s;
+        sfCap = computeSfCap(s);
+      }
     } catch (e) {
       if (seq === fetchSeq) error = e instanceof Error ? e.message : String(e);
+    } finally {
+      fetchInflight = false;
+      if (fetchPending) {
+        fetchPending = false;
+        fetchSlice(); // chase the latest slider position
+      }
     }
   }
 

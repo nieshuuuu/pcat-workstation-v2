@@ -1205,18 +1205,19 @@ pub async fn load_patient_all(
     Ok(PatientLoadResult { series: descriptors, active_index, failures })
 }
 
-/// Switch the active volume to a previously-loaded series (must be resident
-/// in the volume cache — call `load_patient_all` or `load_series` first).
+/// Make `(dir, uid)` the active volume in Rust state (so Water/Lipid, MMD and
+/// the FAI pipeline operate on it), decoding it on first access. Returns the
+/// metadata plus a shared handle to the decoded voxels — callers decide whether
+/// to ship the voxels to the frontend.
 ///
-/// Returns the framed low-energy-style binary bundle so the frontend can
-/// rebuild the cornerstone3D volume identical to `load_series`.
-#[tauri::command]
-pub async fn set_active_volume(
-    dir: String,
-    uid: String,
-    state: State<'_, Mutex<AppState>>,
-) -> Result<Response, String> {
-    let key = (dir.clone(), uid.clone());
+/// This is the single source of the activation logic: both `set_active_volume`
+/// (returns voxels) and `set_active_volume_meta` (metadata only) go through it.
+async fn activate_volume(
+    dir: &str,
+    uid: &str,
+    state: &State<'_, Mutex<AppState>>,
+) -> Result<(PipelineVolumeMetadata, Arc<Vec<i16>>), String> {
+    let key = (dir.to_string(), uid.to_string());
 
     // Fast path: the series is already decoded + cached.
     let cached_hit = {
@@ -1231,41 +1232,69 @@ pub async fn set_active_volume(
         }
     };
 
-    let (metadata, voxels) = match cached_hit {
-        Some(hit) => hit,
-        None => {
-            // Lazy decode-on-demand: `load_patient_all` scans every series but
-            // only decodes the ones needed up front (active + dual-energy pair).
-            // Switching to any other series decodes it here on first access,
-            // then it stays cached. This is what keeps the initial load fast.
-            let vol = dicom_load::load_series(Path::new(&dir), &uid, None)
-                .await
-                .map_err(|e| format!("decode failed: {e}"))?;
-            bridge_into_state(&vol, &state)?;
-            let meta = vol.metadata.clone();
-            let voxels_arc: Arc<Vec<i16>> = Arc::new(vol.voxels_i16);
-            let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
-            guard.current_volume_key = Some(key.clone());
-            guard.last_metadata = Some(meta.clone());
-            let cached_volume = guard
-                .volume
-                .clone()
-                .expect("bridge_into_state populated state.volume");
-            guard.volume_cache.insert(
-                key.clone(),
-                CachedVolume {
-                    metadata: meta.clone(),
-                    voxels_i16: Arc::clone(&voxels_arc),
-                    volume: cached_volume,
-                },
-            );
-            (meta, voxels_arc)
-        }
-    };
+    if let Some(hit) = cached_hit {
+        return Ok(hit);
+    }
 
+    // Lazy decode-on-demand: `load_patient_all` scans every series but only
+    // decodes the ones needed up front (active + dual-energy pair). Switching
+    // to any other series decodes it here on first access, then it stays
+    // cached. This is what keeps the initial load fast.
+    let vol = dicom_load::load_series(Path::new(dir), uid, None)
+        .await
+        .map_err(|e| format!("decode failed: {e}"))?;
+    bridge_into_state(&vol, state)?;
+    let meta = vol.metadata.clone();
+    let voxels_arc: Arc<Vec<i16>> = Arc::new(vol.voxels_i16);
+    let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
+    guard.current_volume_key = Some(key.clone());
+    guard.last_metadata = Some(meta.clone());
+    let cached_volume = guard
+        .volume
+        .clone()
+        .expect("bridge_into_state populated state.volume");
+    guard.volume_cache.insert(
+        key,
+        CachedVolume {
+            metadata: meta.clone(),
+            voxels_i16: Arc::clone(&voxels_arc),
+            volume: cached_volume,
+        },
+    );
+    Ok((meta, voxels_arc))
+}
+
+/// Switch the active volume to a previously-loaded series (must be resident
+/// in the volume cache — call `load_patient_all` or `load_series` first).
+///
+/// Returns the framed low-energy-style binary bundle so the frontend can
+/// rebuild the cornerstone3D volume identical to `load_series`.
+#[tauri::command]
+pub async fn set_active_volume(
+    dir: String,
+    uid: String,
+    state: State<'_, Mutex<AppState>>,
+) -> Result<Response, String> {
+    let (metadata, voxels) = activate_volume(&dir, &uid, &state).await?;
     let voxel_bytes: Vec<u8> = bytemuck::cast_slice(&voxels[..]).to_vec();
     let framed = encode_frame(&metadata, &voxel_bytes)?;
     Ok(Response::new(framed))
+}
+
+/// Activate a volume in Rust state and return ONLY its metadata (JSON), never
+/// the voxels. The frontend calls this when cornerstone3D already holds the
+/// volume in its GPU/scalar cache, so re-shipping 150–220 MB of voxels over IPC
+/// — the dominant cost of switching between already-viewed series — is skipped
+/// entirely. On a cornerstone cache miss the frontend falls back to
+/// `set_active_volume` to obtain the voxels.
+#[tauri::command]
+pub async fn set_active_volume_meta(
+    dir: String,
+    uid: String,
+    state: State<'_, Mutex<AppState>>,
+) -> Result<PipelineVolumeMetadata, String> {
+    let (metadata, _voxels) = activate_volume(&dir, &uid, &state).await?;
+    Ok(metadata)
 }
 
 #[cfg(test)]

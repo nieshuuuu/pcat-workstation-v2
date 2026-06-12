@@ -24,6 +24,7 @@
     loadDualEnergy,
     loadPatientAll,
     setActiveVolume,
+    setActiveVolumeMeta,
     onDicomLoadProgress,
     reuseLoadedVolume,
   } from '$lib/api';
@@ -494,16 +495,27 @@
       volumeStore.setLoading(true);
       volumeStore.setLoadProgress(0);
 
-      const { metadata, voxels } = await setActiveVolume(entry.path, entry.uid);
       const volumeKey = `${entry.path}::${entry.uid}`;
+      const csVolumeId = `pcat:${volumeKey}`;
 
-      // If cornerstone already holds this volume, buildVolume short-circuits.
+      // When cornerstone3D already holds this volume's pixels, skip the
+      // 150–220 MB voxel IPC transfer entirely — fetch only the metadata and
+      // re-bind the cached GPU volume. Switching between already-viewed series
+      // (CCTA ⇄ CaScore ⇄ keV) is then a metadata round-trip, not a full
+      // re-marshal of the volume. Only a genuine cornerstone miss pays for the
+      // voxels.
+      // `metadata` is the API series metadata (series_uid, num_slices, …),
+      // distinct from the store's VolumeMetadata built below. Derive its type
+      // from the API call to avoid the name collision with the store type.
+      let metadata: Awaited<ReturnType<typeof setActiveVolumeMeta>>;
       let csId: string;
-      const cached = cornerstoneCache.getVolume(`pcat:${volumeKey}`);
-      if (cached) {
-        csId = `pcat:${volumeKey}`;
+      if (cornerstoneCache.getVolume(csVolumeId)) {
+        metadata = await setActiveVolumeMeta(entry.path, entry.uid);
+        csId = csVolumeId;
       } else {
-        csId = buildVolume(volumeKey, metadata, voxels);
+        const res = await setActiveVolume(entry.path, entry.uid);
+        metadata = res.metadata;
+        csId = buildVolume(volumeKey, metadata, res.voxels);
       }
 
       const direction = computeDirectionMatrix(metadata.orientation);

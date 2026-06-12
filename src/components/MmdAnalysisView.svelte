@@ -61,7 +61,6 @@
   let unit = $state('fraction');
 
   let surfaces = $state<CrossSectionSurface[]>([]);
-  let surfaceIndex = $state(0);
 
   let mmdSummary = $state<MmdSummary | null>(null);
   let mmdBusy = $state(false);
@@ -84,7 +83,6 @@
 
   let currentTarget = $derived(targets[selectedIndex] ?? null);
   let currentSnake = $derived(snakePoints[selectedIndex] ?? null);
-  let currentStatus = $derived(statusMap[selectedIndex] ?? 'pending');
   let contourCount = $derived(Object.keys(snakePoints).length);
   let totalCount = $derived(targets.length);
 
@@ -206,24 +204,13 @@
 
   /* ── Handlers ─────────────────────────────────────────── */
 
+  // Single shared cross-section index drives BOTH the 2D big window (SnakeEditor)
+  // and the 3D surface plot, so moving either one moves the other. `targets`
+  // and `surfaces` are 1:1 (every target auto-adopts a lumen contour → one
+  // surface), so the same index addresses both.
   function handleSelect(index: number) {
-    selectedIndex = index;
-  }
-
-  let resyncTimer: ReturnType<typeof setTimeout> | null = null;
-
-  function handleSnakeUpdate(points: [number, number][]) {
-    snakePoints = { ...snakePoints, [selectedIndex]: points };
-    if (statusMap[selectedIndex] !== 'done') {
-      statusMap = { ...statusMap, [selectedIndex]: 'done' };
-    }
-    // Debounced re-sync: editing the ring contour changes the ROI the 3D
-    // surface samples, so re-run (reusing the Water/Lipid calibration, no
-    // re-calibration) shortly after the user stops dragging. No manual button.
-    if (resyncTimer) clearTimeout(resyncTimer);
-    resyncTimer = setTimeout(() => {
-      if (!mmdBusy) handleRunMmd();
-    }, 500);
+    const max = Math.max(0, targets.length - 1);
+    selectedIndex = Math.max(0, Math.min(max, index));
   }
 
   async function handleSave() {
@@ -281,23 +268,50 @@
   // whenever MMD has produced a result and the cache hasn't seen this target
   // under the active material/unit. Skip when the user has set material='ct'
   // (no overlay, plain HU grayscale).
-  $effect(() => {
-    if (!mmdSummary) return;
-    if (material === 'ct') return;
+  //
+  // Single-in-flight coalescing: scrubbing the cross-section index fires this
+  // effect on every step, but only one overlay request runs at a time. When it
+  // settles we fetch the section the user actually landed on — so a fast scrub
+  // issues a couple of requests, not one IPC call per intermediate section.
+  let overlayInflight = false;
+  function ensureOverlay() {
+    if (!mmdSummary || material === 'ct') return;
+    if (overlayInflight) return;
     const idx = selectedIndex;
     if (overlayCache[idx]) return;
-    getMmdOverlay(idx, material, unit)
+    // Snapshot the material/unit this request is for. `overlayCache` is keyed by
+    // section index ONLY and is cleared on every material/unit switch, so a
+    // result that arrives after the user changed material must be discarded —
+    // otherwise it would write water data into a lipid-keyed cache and the 2D
+    // view would show the wrong decomposition.
+    const reqMat = material;
+    const reqUnit = unit;
+    overlayInflight = true;
+    getMmdOverlay(idx, reqMat, reqUnit)
       .then((data) => {
-        overlayCache = { ...overlayCache, [idx]: data };
+        if (reqMat === material && reqUnit === unit) {
+          overlayCache = { ...overlayCache, [idx]: data };
+        }
       })
       .catch((err) => {
         console.warn('Overlay fetch failed:', err);
+      })
+      .finally(() => {
+        overlayInflight = false;
+        // Re-fire only if the user moved (section/material/unit) during the
+        // request, so we chase the latest selection without spinning on a
+        // section whose fetch keeps failing.
+        const moved = selectedIndex !== idx || material !== reqMat || unit !== reqUnit;
+        if (moved && material !== 'ct' && !overlayCache[selectedIndex]) ensureOverlay();
       });
-  });
-
-  function handleSurfaceSlider(index: number) {
-    surfaceIndex = index;
   }
+  $effect(() => {
+    void selectedIndex;
+    void material;
+    void unit;
+    void mmdSummary;
+    ensureOverlay();
+  });
 
   async function handleRunMmd() {
     if (mmdBusy) return;
@@ -319,7 +333,19 @@
     if (material === 'ct') return; // surfaces are only defined for decomposed materials
     try {
       surfaces = await sampleSurfaces(material, unit);
-      surfaceIndex = Math.min(surfaceIndex, Math.max(0, surfaces.length - 1));
+      // The shared section index addresses both targets[] and surfaces[]
+      // positionally, which is only correct while they stay 1:1 (every target
+      // auto-adopts a lumen contour → one surface). If the backend ever packs
+      // the surfaces vector (e.g. skipping a contourless target), positions
+      // would desync silently — fail loud here instead.
+      if (surfaces.length !== targets.length) {
+        console.warn(
+          `MMD surface/target count mismatch (${surfaces.length} vs ${targets.length}); ` +
+            'the 2D cross-section and 3D surface may show different sections.',
+        );
+      }
+      // Keep the shared section index in range of the freshly sampled surfaces.
+      selectedIndex = Math.min(selectedIndex, Math.max(0, surfaces.length - 1));
     } catch (err) {
       console.error('Failed to sample surfaces:', err);
     }
@@ -338,7 +364,7 @@
   {:else}
     {#if !mmdSummary && !mmdBusy}
       <div class="shrink-0 border-b border-border bg-accent/5 px-3 py-1 text-[11px] text-text-secondary">
-        Synced from the <span class="font-medium text-accent">Water/Lipid</span> decomposition — run that tab first if the maps are empty. Drag contour points to refine the pericoronary ring.
+        Synced from the <span class="font-medium text-accent">Water/Lipid</span> decomposition — run that tab first if the maps are empty. The pericoronary lumen wall is detected automatically.
       </div>
     {/if}
     <!-- Main content: editor + surface plot side-by-side -->
@@ -348,19 +374,12 @@
         {#if currentTarget}
           <SnakeEditor
             target={currentTarget}
-            targetIndex={selectedIndex}
             snakePoints={currentSnake}
-            onSnakeUpdate={handleSnakeUpdate}
-            status={currentStatus}
             {arcOffsetMm}
             overlay={currentOverlay}
             {material}
             {unit}
-            onStepTarget={(delta) => {
-              if (targets.length === 0) return;
-              const next = Math.max(0, Math.min(targets.length - 1, selectedIndex + delta));
-              if (next !== selectedIndex) selectedIndex = next;
-            }}
+            onStepTarget={(delta) => handleSelect(selectedIndex + delta)}
           />
         {/if}
       </div>
@@ -369,10 +388,10 @@
       <div class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <SurfacePlotPanel
           {surfaces}
-          selectedIndex={surfaceIndex}
+          {selectedIndex}
           {material}
           {unit}
-          onSliderChange={handleSurfaceSlider}
+          onSliderChange={handleSelect}
           {arcOffsetMm}
         />
 

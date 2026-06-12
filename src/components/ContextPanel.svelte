@@ -23,13 +23,26 @@
   let hasResults = $derived(pipelineStore.status === 'complete');
   let hasCpr = $derived(phase === 'seeds' || phase === 'analysis');
 
+  // Fullscreen the Analysis dashboard — it's otherwise confined to this narrow
+  // side panel, which is too cramped for the radial/angular charts.
+  let maximized = $state(false);
+
   // Auto-switch to analysis tab when pipeline first completes
   $effect(() => {
     if (pipelineStore.status === 'complete') {
       contextTab = 'analysis';
     }
   });
+
+  function handleKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape' && maximized) {
+      maximized = false;
+      e.stopPropagation();
+    }
+  }
 </script>
+
+<svelte:window onkeydown={handleKeydown} />
 
 <div
   class="flex h-full w-full flex-col bg-surface-secondary text-text-primary"
@@ -124,12 +137,28 @@
         >
           Analysis <span class="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-success"></span>
         </button>
+
+        {#if contextTab === 'analysis'}
+          <button
+            class="ml-auto px-2.5 text-xs font-medium text-text-secondary transition-colors hover:text-accent"
+            onclick={() => (maximized = true)}
+            title="Fullscreen analysis"
+            aria-label="Fullscreen analysis"
+          >
+            ⤢
+          </button>
+        {/if}
       </div>
     {/if}
 
-    <!-- Content -->
+    <!-- Content. When maximized, the dashboard renders in the overlay below
+         instead, so it mounts exactly once (one Plotly instance). -->
     <div class="min-h-0 flex-1">
-      {#if hasResults && contextTab === 'analysis'}
+      {#if maximized && hasResults && contextTab === 'analysis'}
+        <div class="flex h-full items-center justify-center text-xs text-text-secondary/60">
+          Analysis shown fullscreen — press Esc or Close to return.
+        </div>
+      {:else if hasResults && contextTab === 'analysis'}
         <AnalysisDashboard />
       {:else}
         <CprView />
@@ -137,3 +166,24 @@
     </div>
   {/if}
 </div>
+
+<!-- Fullscreen Analysis overlay -->
+{#if maximized && hasResults}
+  <div class="fixed inset-0 z-50 flex flex-col bg-surface">
+    <div class="flex shrink-0 items-center justify-between border-b border-border bg-surface-secondary px-4 py-2">
+      <span class="text-sm font-semibold text-text-primary">
+        FAI Analysis <span class="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-success"></span>
+      </span>
+      <button
+        class="rounded bg-surface-tertiary px-3 py-1 text-xs font-medium text-text-primary hover:bg-surface-tertiary/80"
+        onclick={() => (maximized = false)}
+        title="Exit fullscreen (Esc)"
+      >
+        ✕ Close
+      </button>
+    </div>
+    <div class="min-h-0 flex-1">
+      <AnalysisDashboard />
+    </div>
+  </div>
+{/if}

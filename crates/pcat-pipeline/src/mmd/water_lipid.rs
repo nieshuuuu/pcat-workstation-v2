@@ -362,8 +362,19 @@ pub fn self_calibrate(
         0.0
     };
 
-    // Soft-tissue gate on the low-energy HU (uses the adipose endpoint).
-    let gate = [hu_l[0] - 40.0, 150.0];
+    // Soft-tissue gate on the low-energy HU: [lo, hi]. The job of the LOWER
+    // bound is to drop gas/lung/air (HU ≲ −350), NOT to clip the fat itself.
+    // The old bound `hu_l[0] - 40` sat barely below the *mean* subcutaneous-fat
+    // HU (~1–2σ), so the lower tail of genuine adipose — the most lipid-rich and
+    // the noisiest voxels, i.e. exactly the pericoronary fat we measure — fell
+    // outside and was dropped to NaN (e.g. a −157 HU fat voxel at a vessel edge
+    // where low-keV noise + partial volume push it down). Place the lower bound
+    // several fat-noise σ below the adipose endpoint so the whole fat
+    // distribution is kept, and clamp it to a physical fat↔lung window: never
+    // above −200 (keeps even pure fat in low-noise scans) and never below −350
+    // (never admits lung/gas). σ scales it for the noisier low-keV/PCCT regime.
+    let gate_lo = (hu_l[0] - 6.0 * sigma_fat[0]).clamp(-350.0, -200.0);
+    let gate = [gate_lo, 150.0];
 
     // Fraction of volume voxels that pass the gate.
     let kept: usize = lo
@@ -601,6 +612,19 @@ mod tests {
         // Theoretical endpoint is the baked NIST value at 70/150, not the planted fat.
         assert!((calib.hu_l_theo[0] - (-111.6949)).abs() < 1e-3);
         assert!((calib.hu_l_theo[1] - (-81.2130)).abs() < 1e-3);
+
+        // The soft-tissue gate must keep the fat distribution, not clip it. Its
+        // lower bound sits in the physical fat↔lung window [−350, −200], so a
+        // genuinely fat voxel (e.g. −157 HU at a noisy vessel edge) is NOT
+        // gated, while lung/gas (−600 HU) still is. (Regression: the old
+        // `hu_l[0] - 40` bound ≈ −140 gated real adipose.)
+        assert!(
+            (-350.0..=-200.0).contains(&calib.gate[0]),
+            "gate lower bound outside the fat↔lung window: {}",
+            calib.gate[0]
+        );
+        assert!(-157.0 >= calib.gate[0], "a −157 HU fat voxel must pass the gate");
+        assert!(-600.0 < calib.gate[0], "lung/gas at −600 HU must still be gated");
     }
 
     #[test]

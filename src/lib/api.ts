@@ -178,6 +178,18 @@ export async function setActiveVolume(
   return { metadata, voxels };
 }
 
+/** Activate a series in Rust state and return ONLY its metadata — no voxels.
+ *  Use this when cornerstone3D already holds the volume (the common case when
+ *  toggling between already-viewed series): it skips the 150–220 MB voxel IPC
+ *  transfer that dominates `setActiveVolume`. Fall back to `setActiveVolume`
+ *  on a cornerstone cache miss to obtain the pixels. */
+export async function setActiveVolumeMeta(
+  dir: string,
+  uid: string,
+): Promise<VolumeMetadata> {
+  return invoke<VolumeMetadata>('set_active_volume_meta', { dir, uid });
+}
+
 export async function loadDualEnergy(
   lowDir: string,
   highDir: string,
@@ -305,28 +317,6 @@ export async function evolveSnake(
   });
 }
 
-/** Replace the snake control points for a target (after manual drag). */
-export async function updateSnakePoints(
-  targetIndex: number,
-  points: [number, number][],
-): Promise<void> {
-  return invoke<void>('update_snake_points', {
-    targetIndex,
-    points,
-  });
-}
-
-/** Insert a new control point on the snake contour at a given position. */
-export async function addSnakePoint(
-  targetIndex: number,
-  position: [number, number],
-): Promise<number> {
-  return invoke<number>('add_snake_point', {
-    targetIndex,
-    position,
-  });
-}
-
 /** Finalize the contour for a target (marks it as done). */
 export async function finalizeContour(
   targetIndex: number,
@@ -362,6 +352,12 @@ export async function runMmdOnRoi(
   return invoke<MmdSummary>('run_mmd_on_roi', { method });
 }
 /* ── Surface sampling + MMD overlay ─────────────────────── */
+
+/** Upper bound of the MMD mass-density color/axis scale, in mg/mL. Canonical
+ *  home for both the 2D cross-section overlay (SnakeEditor) and the 3D surface
+ *  (SurfacePlotPanel) so the two render the same value as the same color.
+ *  ≈ water density (1000) plus headroom for the f_w > 1 contamination signature. */
+export const MMD_MASS_MAX_MGML = 1100;
 
 export type CrossSectionSurface = {
   arc_mm: number;
