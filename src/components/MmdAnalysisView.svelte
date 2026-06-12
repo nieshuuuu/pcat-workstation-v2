@@ -113,7 +113,12 @@
 
   $effect(() => {
     if (centerlineMm.length < 2) return;
-    const key = centerlineKey(centerlineMm);
+    // Include the ostium fraction in the key so SETTING/MOVING the ostium after
+    // the centerline exists regenerates the cross-sections to start there
+    // (otherwise the effect only fired on centerline geometry changes and the
+    // sections kept starting at waypoint 0).
+    const ostiumFrac = seedStore.getOstiumFraction(seedStore.activeVessel);
+    const key = `${centerlineKey(centerlineMm)}|o:${ostiumFrac ?? 'none'}`;
     if (key === lastCenterlineKey) return;
     lastCenterlineKey = key;
     loadTargets();
@@ -205,13 +210,20 @@
     selectedIndex = index;
   }
 
+  let resyncTimer: ReturnType<typeof setTimeout> | null = null;
+
   function handleSnakeUpdate(points: [number, number][]) {
     snakePoints = { ...snakePoints, [selectedIndex]: points };
-    // No Accept step: edits stay immediately usable for Run MMD, so the
-    // section is always "done" as long as it has a contour.
     if (statusMap[selectedIndex] !== 'done') {
       statusMap = { ...statusMap, [selectedIndex]: 'done' };
     }
+    // Debounced re-sync: editing the ring contour changes the ROI the 3D
+    // surface samples, so re-run (reusing the Water/Lipid calibration, no
+    // re-calibration) shortly after the user stops dragging. No manual button.
+    if (resyncTimer) clearTimeout(resyncTimer);
+    resyncTimer = setTimeout(() => {
+      if (!mmdBusy) handleRunMmd();
+    }, 500);
   }
 
   async function handleSave() {
@@ -324,9 +336,9 @@
       <span class="text-xs text-text-secondary">No annotation targets. Ensure a centerline with 2+ points is selected.</span>
     </div>
   {:else}
-    {#if !mmdSummary}
+    {#if !mmdSummary && !mmdBusy}
       <div class="shrink-0 border-b border-border bg-accent/5 px-3 py-1 text-[11px] text-text-secondary">
-        Auto-adopted lumen wall — drag points to refine, then <span class="font-medium text-accent">Run MMD</span>.
+        Synced from the <span class="font-medium text-accent">Water/Lipid</span> decomposition — run that tab first if the maps are empty. Drag contour points to refine the pericoronary ring.
       </div>
     {/if}
     <!-- Main content: editor + surface plot side-by-side -->
@@ -393,15 +405,6 @@
 
       <div class="ml-auto flex items-center gap-2">
         <button
-          class="rounded bg-accent/15 px-3 py-1 text-xs font-medium text-accent hover:bg-accent/25 active:bg-accent/35 disabled:bg-surface-tertiary/40 disabled:text-text-secondary/70"
-          onclick={handleRunMmd}
-          disabled={mmdBusy || contourCount === 0}
-          title="Run noise-aware water/lipid (GLS) decomposition on the current contours"
-        >
-          {mmdBusy ? 'Running...' : 'Run Water/Lipid'}
-        </button>
-
-        <button
           class="rounded bg-surface-tertiary px-3 py-1 text-xs font-medium text-text-primary hover:bg-surface-tertiary/80 active:bg-surface-tertiary/60 disabled:bg-surface-tertiary/40 disabled:text-text-secondary/70"
           onclick={handleSave}
           disabled={saveBusy || targets.length === 0}
@@ -427,14 +430,18 @@
           <span class="text-[10px] text-success">{saveMsg}</span>
         {/if}
 
-        {#if mmdSummary}
-          <span class="text-[10px] text-success">
-            MMD {mmdSummary.converged ? 'converged' : 'done'} ({mmdSummary.n_voxels.toLocaleString()} voxels)
+        {#if mmdBusy}
+          <span class="text-[11px] text-text-secondary">Syncing from Water/Lipid…</span>
+        {:else if mmdSummary}
+          <span class="text-[10px] text-success" title="Synced from the Water/Lipid calibration">
+            Synced ({mmdSummary.n_voxels.toLocaleString()} voxels)
           </span>
         {/if}
 
         {#if mmdError}
-          <span class="max-w-[24ch] truncate text-[10px] text-error">{mmdError}</span>
+          <span class="max-w-[28ch] truncate text-[10px] text-error" title={mmdError}>
+            {mmdError.includes('calibration') ? 'Run the Water/Lipid tab first' : mmdError}
+          </span>
         {/if}
       </div>
     </div>

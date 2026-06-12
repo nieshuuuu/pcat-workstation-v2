@@ -112,18 +112,21 @@
     const [vMin, vMax] = overlayRange();
     const vSpan = vMax - vMin;
 
+    // Translucent overlay so the CT anatomy shows THROUGH the material color
+    // ("heatmap overlay on the CT scan", not a flat heatmap that hides it).
+    const OVERLAY_ALPHA = 0.6;
     for (let i = 0; i < target.image.length; i++) {
       const hu = target.image[i];
       const gray = Math.max(0, Math.min(255, Math.round(((hu - lo) / range) * 255)));
 
       const ov = overlay ? overlay[i] : NaN;
       if (overlay && !Number.isNaN(ov)) {
-        // Material overlay inside the ROI: rainbow colormap.
+        // Jet material color alpha-blended over the CT grayscale.
         const t = vSpan > 0 ? (ov - vMin) / vSpan : 0;
         const [r, g, b] = jetColor(t);
-        imgData.data[i * 4] = r;
-        imgData.data[i * 4 + 1] = g;
-        imgData.data[i * 4 + 2] = b;
+        imgData.data[i * 4] = Math.round(r * OVERLAY_ALPHA + gray * (1 - OVERLAY_ALPHA));
+        imgData.data[i * 4 + 1] = Math.round(g * OVERLAY_ALPHA + gray * (1 - OVERLAY_ALPHA));
+        imgData.data[i * 4 + 2] = Math.round(b * OVERLAY_ALPHA + gray * (1 - OVERLAY_ALPHA));
       } else {
         imgData.data[i * 4] = gray;
         imgData.data[i * 4 + 1] = gray;

@@ -54,24 +54,17 @@
 
     const s = surfaces[selectedIndex];
 
-    // Display range per unit. Fractions are vol% in [0, 100]; the noise-aware
-    // GLS estimate can read slightly outside (low-HU fat > 100 %, fibrous/wall
-    // < 0 %), so clamp for a readable surface. Gated (non-soft-tissue) voxels
-    // arrive as NaN and render as gaps. Raw values are still exported via CSV.
-    const [zMin, zMax] = unit === 'fraction' ? [0, 100] : [0, 1000];
-
-    // Build z matrix: [n_theta x n_radial], NaN -> null (gap), else clamped.
+    // Build z matrix: [n_theta x n_radial], NaN -> null (gap) for Plotly. The
+    // backend now soft-tissue-gates the decomposition (non-tissue voxels are
+    // NaN), so the egregious −300 % values from iodine-blood/calcium are gone;
+    // the surface auto-scales to the real lipid spread and shows 3D structure
+    // again (fat peaks, fibrous/wall valleys). fraction -> vol%, mass passes through.
     const z: (number | null)[][] = [];
     for (let it = 0; it < s.n_theta; it++) {
       const row: (number | null)[] = [];
       for (let ir = 0; ir < s.n_radial; ir++) {
         const val = s.surface[it * s.n_radial + ir];
-        if (isNaN(val)) {
-          row.push(null);
-          continue;
-        }
-        const scaled = unit === 'fraction' ? val * 100 : val;
-        row.push(Math.max(zMin, Math.min(zMax, scaled)));
+        row.push(isNaN(val) ? null : unit === 'fraction' ? val * 100 : val);
       }
       z.push(row);
     }
@@ -82,8 +75,6 @@
       y: s.theta_deg,
       z: z,
       colorscale: 'Viridis',
-      cmin: zMin,
-      cmax: zMax,
       showscale: true,
       colorbar: {
         title: { text: materialLabel(material, unit), font: { size: 10, color: '#e5e5e7' } },
@@ -116,7 +107,6 @@
         },
         zaxis: {
           title: { text: materialLabel(material, unit), font: { size: 9 } },
-          range: [zMin, zMax],
           gridcolor: '#38383a',
           color: '#98989d',
         },

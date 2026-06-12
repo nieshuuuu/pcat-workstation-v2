@@ -648,25 +648,26 @@
         {/if}
       </button>
       <button
-        class="relative px-3 py-1.5 text-xs font-medium transition-colors {activeTab === 'mmd'
-          ? 'text-accent'
-          : 'text-text-secondary hover:text-text-primary'}"
-        onclick={() => { activeTab = 'mmd'; }}
-      >
-        MMD Analysis
-        {#if activeTab === 'mmd'}
-          <span class="absolute inset-x-0 bottom-0 h-[2px] bg-accent"></span>
-        {/if}
-      </button>
-      <button
         class="relative px-3 py-1.5 text-xs font-medium transition-colors {activeTab === 'wl'
           ? 'text-accent'
           : 'text-text-secondary hover:text-text-primary'}"
         onclick={() => { activeTab = 'wl'; }}
-        title="Whole-volume noise-aware GLS water/lipid decomposition"
+        title="Whole-volume noise-aware GLS water/lipid decomposition — run this first"
       >
         Water/Lipid
         {#if activeTab === 'wl'}
+          <span class="absolute inset-x-0 bottom-0 h-[2px] bg-accent"></span>
+        {/if}
+      </button>
+      <button
+        class="relative px-3 py-1.5 text-xs font-medium transition-colors {activeTab === 'mmd'
+          ? 'text-accent'
+          : 'text-text-secondary hover:text-text-primary'}"
+        onclick={() => { activeTab = 'mmd'; }}
+        title="Pericoronary cross-section + 3D surface, synced from the Water/Lipid decomposition"
+      >
+        MMD Analysis
+        {#if activeTab === 'mmd'}
           <span class="absolute inset-x-0 bottom-0 h-[2px] bg-accent"></span>
         {/if}
       </button>
