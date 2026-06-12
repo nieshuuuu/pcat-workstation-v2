@@ -17,6 +17,13 @@ use crate::dicom_scan::{scan_series, SeriesDescriptor};
 /// 4 GB soft limit (conservative — covers 1000-slice 512² i16 at 1.5 GB).
 const VOLUME_SIZE_LIMIT_MB: usize = 4096;
 
+/// Concurrent file reads during pixel decode. The decode is I/O-LATENCY bound on
+/// network mounts (SMB), where each file open is a slow round-trip; the default
+/// rayon pool (~num_cores) leaves the link mostly idle. Far more threads overlap
+/// the per-file latency. The CPU decode is ~0.5 ms/slice, so on local disk the
+/// extra threads finish near-instantly (negligible overhead).
+const READ_CONCURRENCY: usize = 64;
+
 /// Metadata subset that travels with a loaded volume's pixel bytes.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VolumeMetadata {
@@ -125,22 +132,35 @@ pub async fn load_series(
         let step = (total / 50).max(1);
 
         let mut out = vec![0i16; total_voxels];
-        let results: Vec<Result<(usize, Vec<i16>), DicomLoadError>> = file_paths
-            .par_iter()
-            .enumerate()
-            .map(|(z, p)| {
-                let px = decode_slice_i16(p, rescale_slope, rescale_intercept, rows, cols)
-                    .map(|px| (z, px));
-                // Increment counter and emit if on a reporting boundary.
-                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                if let Some(ref cb) = progress {
-                    if done % step == 0 || done == total {
-                        cb(done, total);
+
+        // Decode on a high-concurrency pool so many SMB reads overlap (see
+        // READ_CONCURRENCY). Fall back to the global rayon pool if the dedicated
+        // one can't be built.
+        let run = || -> Vec<Result<(usize, Vec<i16>), DicomLoadError>> {
+            file_paths
+                .par_iter()
+                .enumerate()
+                .map(|(z, p)| {
+                    let px = decode_slice_i16(p, rescale_slope, rescale_intercept, rows, cols)
+                        .map(|px| (z, px));
+                    // Increment counter and emit if on a reporting boundary.
+                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(ref cb) = progress {
+                        if done % step == 0 || done == total {
+                            cb(done, total);
+                        }
                     }
-                }
-                px
-            })
-            .collect();
+                    px
+                })
+                .collect()
+        };
+        let results = match rayon::ThreadPoolBuilder::new()
+            .num_threads(READ_CONCURRENCY)
+            .build()
+        {
+            Ok(pool) => pool.install(run),
+            Err(_) => run(),
+        };
         for r in results {
             let (z, px) = r?;
             out[z * slice_len..(z + 1) * slice_len].copy_from_slice(&px);

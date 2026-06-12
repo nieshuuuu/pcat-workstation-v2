@@ -163,7 +163,10 @@ use tokio::sync::Semaphore;
 
 /// Concurrent header opens. Empirically 32–64 is the SMB sweet spot; 48 is a
 /// conservative middle value.
-const SCAN_CONCURRENCY: usize = 48;
+// Concurrent header reads. The scan is I/O-latency bound on network mounts
+// (SMB) — each open is a slow round-trip — so we read far more than CPU cores in
+// flight to overlap the latency.
+const SCAN_CONCURRENCY: usize = 64;
 
 /// Public descriptor for a single series, used by Tauri commands and frontend.
 #[derive(Debug, Clone, serde::Serialize)]
