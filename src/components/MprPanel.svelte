@@ -125,6 +125,7 @@
     if (!csVolumeId || !engineReady) return;
 
     const engine = getRenderingEngine();
+    const _tBind = performance.now();
 
     setVolumesForViewports(
       engine,
@@ -156,6 +157,9 @@
         console.warn('MprPanel: failed to set slab', e);
       }
       engine.renderViewports(VIEWPORT_IDS);
+      console.log(
+        `[load-timing] MPR setVolumesForViewports + render (cornerstone GPU upload) = ${(performance.now() - _tBind) | 0}ms`,
+      );
     });
   });
 
