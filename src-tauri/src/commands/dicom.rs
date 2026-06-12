@@ -1099,9 +1099,19 @@ pub async fn load_patient_all(
                 }
             }
         } else {
-            failures.push(
-                "dual-energy pairing skipped: keV series have different voxel grids".into(),
-            );
+            // Show the actual dims so a mismatch (e.g. a flaky SMB scan dropping
+            // slices from one series → different num_slices) is diagnosable.
+            failures.push(format!(
+                "dual-energy pairing skipped: keV grids differ — {} keV {}×{}×{} vs {} keV {}×{}×{}",
+                low_kev,
+                low_vol.metadata.rows,
+                low_vol.metadata.cols,
+                low_vol.metadata.num_slices,
+                high_kev,
+                high_vol.metadata.rows,
+                high_vol.metadata.cols,
+                high_vol.metadata.num_slices,
+            ));
         }
     }
 
