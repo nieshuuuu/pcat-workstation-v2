@@ -1,7 +1,12 @@
 use std::path::Path;
 use pcat_pipeline::dicom_loader::load_dicom_directory;
 
+// Manual diagnostic, not a CI test: it `.unwrap()`s hardcoded absolute paths to
+// MonoPlus_{70,100,140,150}keV subdirs. Most patients (e.g. 57955439) only have
+// 70/150, so the 100/140 unwraps panic. Run explicitly with `--ignored` when the
+// full keV set is present locally.
 #[test]
+#[ignore = "manual diagnostic; needs all hardcoded MonoPlus keV subdirs present locally"]
 fn debug_voxel_values() {
     let base = "/Users/shunie/Developer/PCAT/UCI NAEOTOM CCTA Data/57955439";
     let dirs = [

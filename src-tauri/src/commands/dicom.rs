@@ -867,11 +867,16 @@ pub async fn load_patient_all(
 
     let total = subdirs.len();
     let mut descriptors: Vec<LoadedSeriesDescriptor> = Vec::new();
+    // Parallel to `descriptors` — the folder each series lives in, for lazy decode.
+    let mut series_dirs: Vec<PathBuf> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
 
+    // Phase 1 — SCAN every series (header-only, fast, NO pixel decode) to build
+    // the volume-switcher list. Decoding all series up front was the slow path
+    // (a NAEOTOM patient has many keV series + CCTA + CaScore, each decoded
+    // sequentially). We decode only what's needed in Phase 2 and lazy-decode the
+    // rest on demand in `set_active_volume`.
     for (i, (name, series_dir)) in subdirs.into_iter().enumerate() {
-        // Phase "patient_series" signals the start of a new series and carries
-        // its folder name as `detail` so the footer can show "Loading X/Y: name".
         let _ = app.emit(
             "dicom_load_progress",
             ProgressEvent {
@@ -882,7 +887,6 @@ pub async fn load_patient_all(
             },
         );
 
-        // Scan to get the series UID (first series in the folder).
         let scan = match dicom_scan::scan_series(&series_dir).await {
             Ok(s) => s,
             Err(e) => {
@@ -894,78 +898,18 @@ pub async fn load_patient_all(
             failures.push(format!("{name}: no DICOM series found"));
             continue;
         };
-        let uid = first.uid.clone();
-        let path_str = series_dir.to_string_lossy().into_owned();
-        let cache_key = (path_str.clone(), uid.clone());
-
-        // Skip decode if already cached.
-        let already_cached = {
-            let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
-            guard.volume_cache.get(&cache_key).is_some()
-        };
-
-        let metadata: PipelineVolumeMetadata = if already_cached {
-            // Already resident — just read the cached metadata back.
-            let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
-            guard.volume_cache.get(&cache_key).unwrap().metadata.clone()
-        } else {
-            // Fine-grained per-slice progress so the footer bar animates
-            // smoothly within each series. The coarse "patient_series" event
-            // emitted just before this series started already carries the
-            // series index + name, so we only need `decoding` here.
-            let app_cb = app.clone();
-            let progress: Box<dyn Fn(usize, usize) + Send + Sync> = Box::new(move |done, total_slices| {
-                let _ = app_cb.emit(
-                    "dicom_load_progress",
-                    ProgressEvent { phase: "decoding", done, total: total_slices, detail: None },
-                );
-            });
-
-            let vol = match dicom_load::load_series(&series_dir, &uid, Some(progress)).await {
-                Ok(v) => v,
-                Err(e) => {
-                    failures.push(format!("{name}: decode failed: {e}"));
-                    continue;
-                }
-            };
-
-            if let Err(e) = bridge_into_state(&vol, &state) {
-                failures.push(format!("{name}: bridge failed: {e}"));
-                continue;
-            }
-
-            let meta_clone = vol.metadata.clone();
-            let voxels_arc: Arc<Vec<i16>> = Arc::new(vol.voxels_i16);
-            {
-                let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
-                guard.current_volume_key = Some(cache_key.clone());
-                guard.last_metadata = Some(meta_clone.clone());
-                let cached_volume = guard
-                    .volume
-                    .clone()
-                    .expect("bridge_into_state populated state.volume");
-                guard.volume_cache.insert(
-                    cache_key.clone(),
-                    CachedVolume {
-                        metadata: meta_clone.clone(),
-                        voxels_i16: Arc::clone(&voxels_arc),
-                        volume: cached_volume,
-                    },
-                );
-            }
-            meta_clone
-        };
 
         descriptors.push(LoadedSeriesDescriptor {
             name: name.clone(),
-            path: path_str,
-            uid,
-            series_description: metadata.series_description.clone(),
+            path: series_dir.to_string_lossy().into_owned(),
+            uid: first.uid.clone(),
+            series_description: first.description.clone(),
             kev: parse_kev_from_folder(&name),
-            num_slices: metadata.num_slices,
-            rows: metadata.rows as usize,
-            cols: metadata.cols as usize,
+            num_slices: first.num_slices,
+            rows: first.rows as usize,
+            cols: first.cols as usize,
         });
+        series_dirs.push(series_dir);
     }
 
     if descriptors.is_empty() {
@@ -996,6 +940,76 @@ pub async fn load_patient_all(
             best.map(|(i, _)| i)
         })
         .unwrap_or(0);
+
+    // Phase 2 — decode ONLY the series needed right now: the active one (for the
+    // viewport) plus the dual-energy keV pair (lowest + highest, for MMD /
+    // water-lipid). Everything else stays scanned-but-not-decoded and is decoded
+    // on first switch in `set_active_volume`. This is what makes the load fast.
+    let mut need: Vec<usize> = vec![active_index];
+    {
+        let mut kevs: Vec<(usize, f64)> = descriptors
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| d.kev.map(|k| (i, k)))
+            .collect();
+        kevs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if kevs.len() >= 2 {
+            need.push(kevs[0].0); // lowest keV
+            need.push(kevs[kevs.len() - 1].0); // highest keV
+        }
+    }
+    need.sort_unstable();
+    need.dedup();
+
+    for &idx in &need {
+        let cache_key = (descriptors[idx].path.clone(), descriptors[idx].uid.clone());
+        let already_cached = {
+            let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
+            guard.volume_cache.get(&cache_key).is_some()
+        };
+        if already_cached {
+            continue;
+        }
+
+        let app_cb = app.clone();
+        let progress: Box<dyn Fn(usize, usize) + Send + Sync> = Box::new(move |done, total_slices| {
+            let _ = app_cb.emit(
+                "dicom_load_progress",
+                ProgressEvent { phase: "decoding", done, total: total_slices, detail: None },
+            );
+        });
+
+        let vol = match dicom_load::load_series(&series_dirs[idx], &descriptors[idx].uid, Some(progress)).await {
+            Ok(v) => v,
+            Err(e) => {
+                failures.push(format!("{}: decode failed: {e}", descriptors[idx].name));
+                continue;
+            }
+        };
+        if let Err(e) = bridge_into_state(&vol, &state) {
+            failures.push(format!("{}: bridge failed: {e}", descriptors[idx].name));
+            continue;
+        }
+        let meta_clone = vol.metadata.clone();
+        let voxels_arc: Arc<Vec<i16>> = Arc::new(vol.voxels_i16);
+        {
+            let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
+            guard.current_volume_key = Some(cache_key.clone());
+            guard.last_metadata = Some(meta_clone.clone());
+            let cached_volume = guard
+                .volume
+                .clone()
+                .expect("bridge_into_state populated state.volume");
+            guard.volume_cache.insert(
+                cache_key.clone(),
+                CachedVolume {
+                    metadata: meta_clone.clone(),
+                    voxels_i16: Arc::clone(&voxels_arc),
+                    volume: cached_volume,
+                },
+            );
+        }
+    }
 
     // Bridge the active one into state.volume (may already be there if it
     // was the last-loaded series; the cache-get-then-write is cheap).
