@@ -24,6 +24,9 @@
      *  volume fraction [0,1] or mass density mg/mL). Rendered as a jet colormap
      *  over the CT when non-null. NaN = gated voxel → plain CT. */
     overlay?: number[] | null;
+    /** Per-pixel 1σ uncertainty of `overlay`, in the same unit (from
+     *  get_mmd_overlay), shown in the hover readout. Null when no overlay. */
+    sigma?: number[] | null;
     /** Material label shown in the colorbar legend. */
     material?: string;
     /** Unit for the overlay: 'fraction' or 'mass'. Controls the colorbar
@@ -39,6 +42,7 @@
     snakePoints,
     arcOffsetMm = 0,
     overlay = null,
+    sigma = null,
     material = '',
     unit = 'fraction',
     onStepTarget,
@@ -48,6 +52,47 @@
 
   let canvasEl: HTMLCanvasElement | undefined = $state();
   let canvasSize = $state(512);
+
+  /* ── Hover readout ─────────────────────────────────────── */
+
+  // Pixel under the cursor → material value ± σ + HU, mirroring the Water/Lipid
+  // view. (col,row) is the cross-section pixel; cx,cy position the floating
+  // tooltip within the canvas pane.
+  let hover = $state<{
+    col: number;
+    row: number;
+    hu: number;
+    val: number;
+    sig: number;
+    cx: number;
+    cy: number;
+  } | null>(null);
+  let matLabel = $derived(
+    material ? material.charAt(0).toUpperCase() + material.slice(1) : 'Value',
+  );
+  // Density is a mass density regardless of the (disabled) unit toggle.
+  let effUnit = $derived(material === 'density' ? 'mass' : unit);
+
+  function handleMove(e: MouseEvent) {
+    if (!canvasEl) return;
+    const rect = canvasEl.getBoundingClientRect();
+    const col = Math.floor(((e.clientX - rect.left) / rect.width) * target.pixels);
+    const row = Math.floor(((e.clientY - rect.top) / rect.height) * target.pixels);
+    if (row < 0 || row >= target.pixels || col < 0 || col >= target.pixels) {
+      hover = null;
+      return;
+    }
+    const i = row * target.pixels + col;
+    hover = {
+      col,
+      row,
+      hu: target.image[i],
+      val: overlay ? overlay[i] : NaN,
+      sig: sigma ? sigma[i] : NaN,
+      cx: e.clientX - rect.left,
+      cy: e.clientY - rect.top,
+    };
+  }
 
   /* ── Coordinate mapping ────────────────────────────────── */
 
@@ -207,10 +252,34 @@
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <canvas
         bind:this={canvasEl}
-        class="h-full w-full rounded"
+        class="h-full w-full rounded {overlay ? 'cursor-crosshair' : ''}"
         style="image-rendering: pixelated;"
         onwheel={handleWheel}
+        onmousemove={handleMove}
+        onmouseleave={() => (hover = null)}
       ></canvas>
+
+      <!-- Hover readout: value ± σ for the selected material/unit (mirrors the
+           Water/Lipid view's tooltip). -->
+      {#if hover}
+        <div
+          class="pointer-events-none absolute z-10 rounded bg-black/75 px-2 py-1 text-[10px] leading-snug text-white tabular-nums shadow-lg"
+          style="left: {hover.cx + 14}px; top: {hover.cy + 14}px;"
+        >
+          {#if Number.isFinite(hover.val)}
+            {#if effUnit === 'mass'}
+              <div>{matLabel} {Math.round(hover.val)} ± {Math.round(hover.sig)} mg/mL</div>
+            {:else}
+              <div>{matLabel} {hover.val.toFixed(2)} ± {hover.sig.toFixed(2)}</div>
+            {/if}
+            <div class="text-white/55">HU {Math.round(hover.hu)} · ({hover.col}, {hover.row})</div>
+          {:else}
+            <div class="text-white/55">
+              HU {Math.round(hover.hu)}{overlay ? ' · gated' : ''} · ({hover.col}, {hover.row})
+            </div>
+          {/if}
+        </div>
+      {/if}
 
       <!-- Frame info overlay -->
       <div class="absolute left-2 top-2 rounded bg-black/40 px-1.5 py-0.5">

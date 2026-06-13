@@ -717,6 +717,33 @@ fn wl_overlay_value(fw: f32, sf: f32, material: &str, unit: &str) -> f32 {
     }
 }
 
+/// 1σ uncertainty of [`wl_overlay_value`], propagated into the SAME unit so the
+/// hover readout can show `value ± sigma`. σ_f is the GLS standard deviation of
+/// the water fraction; the display value is a unit transform of f_w, so its σ is
+/// σ_f times |d(value)/d(f_w)|.
+fn wl_overlay_sigma(sf: f32, material: &str, unit: &str) -> f32 {
+    let rho_w = (pcat_pipeline::mmd::DENSITY_WATER * 1000.0) as f32;
+    let rho_l = (pcat_pipeline::mmd::DENSITY_LIPID * 1000.0) as f32;
+    match (material, unit) {
+        ("water", "mass") => sf * rho_w,
+        ("lipid", "mass") => sf * rho_l,
+        // density = ρ_l + f_w·(ρ_w − ρ_l) ⇒ d/df_w = ρ_w − ρ_l
+        ("density", _) => sf * (rho_w - rho_l).abs(),
+        // The value already IS σ_f — no further uncertainty to show.
+        ("sigma", _) | ("sf", _) => 0.0,
+        // water/lipid volume fractions: d(f)/d(f_w) = ±1 ⇒ σ = σ_f
+        _ => sf,
+    }
+}
+
+/// Per-pixel material overlay for a cross-section: the display `value` (jet-
+/// rendered) plus its 1σ `sigma` in the same unit, both flat `pixels×pixels`.
+#[derive(serde::Serialize)]
+pub struct MmdOverlay {
+    pub value: Vec<f32>,
+    pub sigma: Vec<f32>,
+}
+
 /// Decompose the full CPR cross-section at `target_index` into a material
 /// overlay, computed directly from the self-measured water/lipid calibration
 /// (per-pixel GLS, soft-tissue gated) — the same estimator as the whole-volume
@@ -729,7 +756,7 @@ pub async fn get_mmd_overlay(
     material: String,
     unit: String,
     state: tauri::State<'_, Mutex<AppState>>,
-) -> Result<Vec<f32>, String> {
+) -> Result<MmdOverlay, String> {
     // Pull geometry, the dual-energy volumes, and the calibration under the lock.
     let (low, high, spacing, origin, direction, pos_mm, normal, binormal, pixels, width_mm, calib) = {
         let guard = state.lock().map_err(|e| format!("lock poisoned: {e}"))?;
@@ -805,9 +832,13 @@ pub async fn get_mmd_overlay(
         // GLS-decompose the cross-section (gated, theoretical anchor — matches
         // the Water/Lipid view and run_mmd_on_roi).
         let (fw, sf) = mmd::decompose_slice(&low_cs, &high_cs, &calib, WlAnchor::Theoretical);
-        (0..n)
+        let value: Vec<f32> = (0..n)
             .map(|i| wl_overlay_value(fw[i], sf[i], &material_c, &unit))
-            .collect::<Vec<f32>>()
+            .collect();
+        let sigma: Vec<f32> = (0..n)
+            .map(|i| wl_overlay_sigma(sf[i], &material_c, &unit))
+            .collect();
+        MmdOverlay { value, sigma }
     })
     .await
     .map_err(|e| format!("get_mmd_overlay task failed: {e}"))?;

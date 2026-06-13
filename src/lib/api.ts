@@ -377,13 +377,17 @@ export async function sampleSurfaces(
   return invoke<CrossSectionSurface[]>('sample_surfaces', { material, unit });
 }
 
-/** Get MMD material overlay for a single cross-section (flat f32 array). */
+/** MMD cross-section overlay: per-pixel display `value` (jet-rendered) plus its
+ *  1σ `sigma` in the same unit, both flat `pixels×pixels`. NaN = gated pixel. */
+export type MmdOverlay = { value: number[]; sigma: number[] };
+
+/** Get the MMD material overlay (value + uncertainty) for a cross-section. */
 export async function getMmdOverlay(
   targetIndex: number,
   material: string,
   unit: string,
-): Promise<number[]> {
-  return invoke<number[]>('get_mmd_overlay', { targetIndex, material, unit });
+): Promise<MmdOverlay> {
+  return invoke<MmdOverlay>('get_mmd_overlay', { targetIndex, material, unit });
 }
 
 /* ── Whole-volume noise-aware GLS water/lipid decomposition ─────────────────

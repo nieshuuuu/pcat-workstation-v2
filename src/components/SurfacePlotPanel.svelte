@@ -43,8 +43,8 @@
   // profile. The RADIAL kernel is deliberately tiny: enough to bridge a single
   // empty ring, NOT to smear the few-mm fat band (a wide radial blur is exactly
   // what erases the boundary we measure).
-  const SMOOTH_THETA_FWHM_DEG = 20;
-  const SMOOTH_R_FWHM_MM = 0.5;
+  const SMOOTH_THETA_FWHM_DEG = 35;
+  const SMOOTH_R_FWHM_MM = 0.8;
   const FWHM_TO_SIGMA = 1 / 2.3548; // FWHM = 2·√(2 ln 2)·σ
 
   // Memoize the smoothed grid per (section, unit): revisiting a section — slider
@@ -300,6 +300,16 @@
   onDestroy(() => {
     if (rafId != null) cancelAnimationFrame(rafId);
   });
+
+  // True when the selected section's ring is entirely gated / outside the
+  // volume, so the surface is all-NaN and Plotly would draw a blank — show a
+  // note instead of a confusing empty plot.
+  let currentEmpty = $derived(
+    !!surfaces &&
+      selectedIndex >= 0 &&
+      selectedIndex < surfaces.length &&
+      !surfaces[selectedIndex].surface.some((v) => Number.isFinite(v)),
+  );
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col gap-1.5 p-2">
@@ -315,6 +325,13 @@
       </div>
     {:else}
       <div use:plotContainer class="h-full w-full"></div>
+      {#if currentEmpty}
+        <div class="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <span class="rounded bg-black/40 px-2 py-1 text-xs text-text-secondary">
+            No decomposed tissue in this section's ring
+          </span>
+        </div>
+      {/if}
     {/if}
   </div>
 

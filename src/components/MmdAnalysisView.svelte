@@ -29,6 +29,7 @@
     exportMmdCsv,
     useVesselWallAsContour,
     getMmdOverlay,
+    type MmdOverlay,
   } from '$lib/api';
   import { volumeStore } from '$lib/stores/volumeStore.svelte';
   import { seedStore } from '$lib/stores/seedStore.svelte';
@@ -69,10 +70,12 @@
   /** Per-target flat material overlay (pixels×pixels) for the current
    *  material/unit. Lazily fetched after MMD runs when the user focuses a
    *  section, then cached until material/unit/mmdSummary change. */
-  let overlayCache = $state<Record<number, number[]>>({});
-  let currentOverlay = $derived<number[] | null>(
+  let overlayCache = $state<Record<number, MmdOverlay>>({});
+  let currentOverlayData = $derived<MmdOverlay | null>(
     material === 'ct' ? null : (overlayCache[selectedIndex] ?? null),
   );
+  let currentOverlay = $derived<number[] | null>(currentOverlayData?.value ?? null);
+  let currentSigma = $derived<number[] | null>(currentOverlayData?.sigma ?? null);
 
   let loadingTargets = $state(false);
   let saveBusy = $state(false);
@@ -407,6 +410,7 @@
             snakePoints={currentSnake}
             {arcOffsetMm}
             overlay={currentOverlay}
+            sigma={currentSigma}
             {material}
             {unit}
             onStepTarget={(delta) => handleSelect(selectedIndex + delta)}
