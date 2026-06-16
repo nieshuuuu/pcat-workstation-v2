@@ -71,11 +71,9 @@
       const r: any = e.reason;
       devReport(`unhandledrejection: ${r?.message ?? r}\n${r?.stack ?? ''}`);
     });
-    const SMB = '/Volumes/Molloilab/Shu Nie/UCI NAEOTOM CCTA Data';
+    const LOCAL = '/Users/shunie/Developer/PCAT/UCI NAEOTOM CCTA Data';
     const targets = [
-      `${SMB}/58348842`,   // has Mendonca_results extra subfolder
-      `${SMB}/510829769`,  // user's most-recent SMB whole-patient load
-      `${SMB}/263833681`,
+      `${LOCAL}/58334832`,  // local — isolates release-vs-dev from SMB latency
     ];
     (async () => {
       for (const t of targets) {
