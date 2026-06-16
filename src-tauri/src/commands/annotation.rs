@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use ndarray::Array2;
@@ -16,6 +15,7 @@ use pcat_pipeline::mmd::{self, MmdResult, WlAnchor, WlCalibration};
 use pcat_pipeline::radial_angular::{self, CrossSectionSurface, RadialAngularParams};
 use pcat_pipeline::roi;
 
+use crate::commands::dicom::patient_file_key;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -861,20 +861,6 @@ pub struct AnnotationStateJson {
     pub mmd_converged: Option<bool>,
 }
 
-/// Sanitize a path string into a safe filename component.
-fn sanitize_for_filename(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .replace("..", "_")
-}
-
 /// Save the current annotation state for the given patient (DICOM folder path).
 /// Stores under `app_data_dir/annotations/<sanitized-name>.json`.
 #[tauri::command]
@@ -915,11 +901,7 @@ pub async fn save_annotations(
         .join("annotations");
     let _ = std::fs::create_dir_all(&dir);
 
-    let key = Path::new(&dicom_path)
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_else(|| sanitize_for_filename(&dicom_path));
-    let path = dir.join(format!("{}.json", sanitize_for_filename(&key)));
+    let path = dir.join(patient_file_key(&dicom_path));
 
     let json = serde_json::to_string_pretty(&annotation_state)
         .map_err(|e| format!("serialize failed: {e}"))?;
@@ -936,11 +918,7 @@ fn session_path(app: &tauri::AppHandle, dicom_path: &str) -> std::path::PathBuf 
         .expect("app data dir")
         .join("sessions");
     let _ = std::fs::create_dir_all(&dir);
-    let key = Path::new(dicom_path)
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_else(|| sanitize_for_filename(dicom_path));
-    dir.join(format!("{}.json", sanitize_for_filename(&key)))
+    dir.join(patient_file_key(dicom_path))
 }
 
 /// Unified "save everything" — persist one per-patient session blob (seeds, FAI
@@ -985,11 +963,7 @@ pub async fn load_annotations(
         .app_data_dir()
         .expect("app data dir")
         .join("annotations");
-    let key = Path::new(&dicom_path)
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_else(|| sanitize_for_filename(&dicom_path));
-    let path = dir.join(format!("{}.json", sanitize_for_filename(&key)));
+    let path = dir.join(patient_file_key(&dicom_path));
 
     if !path.exists() {
         return Ok(None);

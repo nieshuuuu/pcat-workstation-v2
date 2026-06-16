@@ -72,11 +72,13 @@ fn sanitize_for_filename(s: &str) -> String {
         .replace("..", "_")
 }
 
-/// Seed-file key derived from the **full** DICOM folder path, so two patients
-/// whose folders end in the same last component (e.g. `.../001/DICOM` and
-/// `.../002/DICOM`) never collide. The last path component is prefixed for
-/// human browseability — the sanitized full path after it guarantees uniqueness.
-fn seeds_filename(dicom_path: &str) -> String {
+/// Per-patient file key derived from the **full** DICOM folder path, so two
+/// patients whose folders share a last component (e.g. every patient's
+/// `MonoPlus_70keV`) never collide. The last component is prefixed for human
+/// browseability; the sanitized full path after it guarantees uniqueness.
+/// SINGLE source of this key for seeds, sessions, AND annotations — route all
+/// per-patient persistence through here so the schemes cannot drift apart.
+pub(crate) fn patient_file_key(dicom_path: &str) -> String {
     let short = Path::new(dicom_path)
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
@@ -94,7 +96,7 @@ fn seeds_filename(dicom_path: &str) -> String {
 pub async fn save_seeds(app: tauri::AppHandle, seeds_json: String, dicom_path: String) -> Result<String, String> {
     let dir = app.path().app_data_dir().expect("app data dir").join("seeds");
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join(seeds_filename(&dicom_path));
+    let path = dir.join(patient_file_key(&dicom_path));
     std::fs::write(&path, &seeds_json).map_err(|e| format!("write failed: {e}"))?;
     Ok(path.to_string_lossy().to_string())
 }
@@ -110,7 +112,7 @@ pub async fn save_seeds(app: tauri::AppHandle, seeds_json: String, dicom_path: S
 #[tauri::command]
 pub async fn load_seeds(app: tauri::AppHandle, dicom_path: String) -> Result<Option<String>, String> {
     let dir = app.path().app_data_dir().expect("app data dir").join("seeds");
-    let path = dir.join(seeds_filename(&dicom_path));
+    let path = dir.join(patient_file_key(&dicom_path));
     if path.exists() {
         let data = std::fs::read_to_string(&path).map_err(|e| format!("read failed: {e}"))?;
         Ok(Some(data))
