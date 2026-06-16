@@ -1,8 +1,8 @@
 use nalgebra::Vector3;
 use ndarray::Array3;
 
-use super::cpr::CprFrame;
-use super::interp::trilinear;
+use crate::cpr::CprFrame;
+use crate::interp::trilinear;
 
 /// Result of contour extraction along a vessel centerline.
 #[derive(Clone)]

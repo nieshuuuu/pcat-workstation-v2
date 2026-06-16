@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * Compound CPR view: straightened or curved CPR image (left 70%) with
+   * Compound CPR view: straightened or stretched CPR image (left 70%) with
    * 3 cross-sections (right 30%) at needle positions A, B, C.
    *
    * Two-phase architecture:
@@ -25,9 +25,9 @@
   import {
     type CprProjectionInfo,
     worldToStraightenedCpr,
-    worldToCurvedCpr,
+    worldToStretchedCpr,
     straightenedCprToWorld,
-    curvedCprToWorld,
+    stretchedCprToWorld,
   } from '$lib/cprProjection';
   import CrossSection from './CrossSection.svelte';
   import { volumeStore } from '$lib/stores/volumeStore.svelte';
@@ -43,17 +43,18 @@
   let windowCenter = $state(volumeStore.current?.windowCenter ?? 40);
   let windowWidth = $state(volumeStore.current?.windowWidth ?? 400);
 
-  // CPR mode: straightened (classic) vs curved (natural vessel path)
-  let cprMode: 'straightened' | 'curved' = $state('curved');
+  // CPR mode: straightened (classic) vs stretched (Horos-style projected)
+  let cprMode: 'straightened' | 'stretched' = $state('stretched');
 
   // FAI overlay toggle
   let showFaiOverlay = $state(false);
 
-  // Auto-enable FAI overlay when analysis completes
+  // Track the FAI overlay to the pipeline status: auto-enable when analysis
+  // completes, and auto-hide when it's reset/cleared (e.g. centerline deleted).
+  // The effect only re-runs on a status change, so a manual toggle while
+  // 'complete' is preserved.
   $effect(() => {
-    if (pipelineStore.status === 'complete') {
-      showFaiOverlay = true;
-    }
+    showFaiOverlay = pipelineStore.status === 'complete';
   });
 
   // Needle B position as fraction (0..1); A and C are offset
@@ -91,11 +92,24 @@
   // Ostium fraction for the active vessel (used in overlays + toolbar)
   let activeOstiumFrac = $derived(seedStore.getOstiumFraction(seedStore.activeVessel));
 
+  // Absolute arc-length (mm) of the ostium along the centerline. Displayed
+  // cross-section distances are computed relative to this so that lengths
+  // match the MMD view (measured from the ostium, not centerline point 0).
+  let ostiumArcMm = $derived.by<number | null>(() => {
+    if (activeOstiumFrac === null || arclengths.length === 0) return null;
+    const n = arclengths.length;
+    const idx = Math.max(0, Math.min(n - 1, Math.round(activeOstiumFrac * (n - 1))));
+    return arclengths[idx];
+  });
+
   // Batch cross-section results (one per needle: A, B, C)
   type BatchCrossSectionItem = {
     imageData: Float32Array;
     pixels: number;
     arc_mm: number;
+    vesselDiameterMm: number;
+    /** Lumen boundary polygon in pixel coords, one [x, y] pair per vertex. */
+    vesselWall: Float32Array;
   };
   let batchXsA = $state<BatchCrossSectionItem | null>(null);
   let batchXsB = $state<BatchCrossSectionItem | null>(null);
@@ -149,7 +163,10 @@
   /**
    * Decode the raw binary cross-sections response:
    *   [n_sections: u32 LE]
-   *   For each: [pixels: u32 LE][arc_mm: f64 LE][image: pixels*pixels * f32 LE]
+   *   For each:
+   *     [pixels: u32 LE][arc_mm: f64 LE][diameter_mm: f64 LE][n_wall: u32 LE]
+   *     [image: pixels*pixels * f32 LE]
+   *     [wall: n_wall * 2 * f32 LE]
    */
   function decodeCrossSectionsBinary(buffer: ArrayBuffer): BatchCrossSectionItem[] {
     const view = new DataView(buffer);
@@ -162,10 +179,19 @@
       offset += 4;
       const arc_mm = view.getFloat64(offset, true);
       offset += 8;
+      const vesselDiameterMm = view.getFloat64(offset, true);
+      offset += 8;
+      const nWall = view.getUint32(offset, true);
+      offset += 4;
+
       const imgLen = pixels * pixels;
       const imageData = new Float32Array(buffer, offset, imgLen);
       offset += imgLen * 4;
-      results.push({ imageData, pixels, arc_mm });
+
+      const vesselWall = new Float32Array(buffer, offset, nWall * 2);
+      offset += nWall * 2 * 4;
+
+      results.push({ imageData, pixels, arc_mm, vesselDiameterMm, vesselWall });
     }
     return results;
   }
@@ -213,13 +239,52 @@
     ctx.putImageData(imgData, 0, 0);
   }
 
+  // ---- Centerline projection cache ----
+  //
+  // `worldToStretchedCpr` for every centerline point costs ~0.02 ms; with
+  // 100 points that's 2 ms per `drawOverlays` call, and the polyline is
+  // redrawn on every overlay effect (60 Hz during needle scroll). The
+  // projection is a pure function of (projectionInfo, canvas w, canvas h)
+  // — cache by identity so back-to-back repaints reuse the same array.
+
+  let centerlineProjCache: Array<[number, number] | null> | null = null;
+  let centerlineProjCacheKey: {
+    info: CprProjectionInfo | null;
+    w: number;
+    h: number;
+  } = { info: null, w: 0, h: 0 };
+
+  function getCachedCenterlineProj(
+    info: CprProjectionInfo,
+    w: number,
+    h: number,
+  ): Array<[number, number] | null> {
+    if (
+      centerlineProjCache !== null
+      && centerlineProjCacheKey.info === info
+      && centerlineProjCacheKey.w === w
+      && centerlineProjCacheKey.h === h
+    ) {
+      return centerlineProjCache;
+    }
+    const nPos = info.positions.length;
+    const step = Math.max(1, Math.floor(nPos / 200));
+    const out: Array<[number, number] | null> = [];
+    for (let j = 0; j < nPos; j += step) {
+      out.push(worldToStretchedCpr(info.positions[j], info, w, h));
+    }
+    centerlineProjCache = out;
+    centerlineProjCacheKey = { info, w, h };
+    return out;
+  }
+
   /** Draw needle lines and arclength ticks as overlay. */
   function drawOverlays(cvs: HTMLCanvasElement) {
     const ctx = cvs.getContext('2d')!;
     const w = cvs.width;
     const h = cvs.height;
 
-    // In curved mode, needle lines are less meaningful (vessel is not straightened)
+    // In stretched mode, needle lines are less meaningful (vessel is not straightened)
     // but we still draw them at the same fractional position for consistency.
 
     // Draw needle lines (vertical)
@@ -274,13 +339,13 @@
       ctx.fillStyle = '#ffee00';
       ctx.fillText('C', xC, 14);
     } else if (projectionInfo) {
-      // Curved mode: draw needle lines perpendicular to vessel tangent
+      // Stretched mode: draw needle lines perpendicular to vessel tangent
       const nPos = projectionInfo.positions.length;
       const drawCurvedNeedle = (frac: number, color: string, label: string, isDashed: boolean) => {
         const idx = Math.round(frac * (nPos - 1));
         const clampedIdx = Math.min(idx, nPos - 1);
         const pos = projectionInfo!.positions[clampedIdx];
-        const projected = worldToCurvedCpr(pos, projectionInfo!, w, h);
+        const projected = worldToStretchedCpr(pos, projectionInfo!, w, h);
         if (!projected) return;
         const [cx, cy] = projected;
 
@@ -289,8 +354,8 @@
         const nextIdx = Math.min(nPos - 1, clampedIdx + 1);
         const prevPos = projectionInfo!.positions[prevIdx];
         const nextPos = projectionInfo!.positions[nextIdx];
-        const prevProj = worldToCurvedCpr(prevPos, projectionInfo!, w, h);
-        const nextProj = worldToCurvedCpr(nextPos, projectionInfo!, w, h);
+        const prevProj = worldToStretchedCpr(prevPos, projectionInfo!, w, h);
+        const nextProj = worldToStretchedCpr(nextPos, projectionInfo!, w, h);
 
         if (prevProj && nextProj) {
           const tx = nextProj[0] - prevProj[0];
@@ -376,17 +441,17 @@
       ctx.stroke();
 
       // Label with background
-      ctx.font = 'bold 10px -apple-system, sans-serif';
+      ctx.font = 'bold 11px -apple-system, sans-serif';
       ctx.textAlign = 'center';
       ctx.fillStyle = '#ff00ff';
       ctx.fillText('OSTIUM', ox, h - 6);
-    } else if (activeOstiumFrac !== null && cprMode === 'curved' && projectionInfo) {
-      // In curved mode, draw ostium marker at the projected position
+    } else if (activeOstiumFrac !== null && cprMode === 'stretched' && projectionInfo) {
+      // In stretched mode, draw ostium marker at the projected position
       const nPos = projectionInfo.positions.length;
       const idx = Math.round(activeOstiumFrac * (nPos - 1));
       const clampedIdx = Math.min(idx, nPos - 1);
       const pos = projectionInfo.positions[clampedIdx];
-      const projected = worldToCurvedCpr(pos, projectionInfo, w, h);
+      const projected = worldToStretchedCpr(pos, projectionInfo, w, h);
       if (projected) {
         const [cx, cy] = projected;
 
@@ -402,7 +467,7 @@
         ctx.restore();
 
         // Label
-        ctx.font = 'bold 10px -apple-system, sans-serif';
+        ctx.font = 'bold 11px -apple-system, sans-serif';
         ctx.textAlign = 'center';
         ctx.fillStyle = '#ff00ff';
         ctx.fillText('OSTIUM', cx, cy - 12);
@@ -410,21 +475,24 @@
     }
 
     // --- Centerline polyline on CPR ---
-    if (projectionInfo && cprMode === 'curved') {
+    // The polyline is redrawn on every overlay repaint (which fires 60 Hz
+    // during a needle scroll / drag). Recomputing 100+ `worldToStretchedCpr`
+    // — each of which is an O(n_cols=128) nearest-segment search — burns
+    // ~2 ms per paint. Cache the projected 2-D points and invalidate only
+    // when the inputs that affect projection actually change.
+    if (projectionInfo && cprMode === 'stretched') {
       const color = VESSEL_COLORS[seedStore.activeVessel];
-      const nPos = projectionInfo.positions.length;
-      const step = Math.max(1, Math.floor(nPos / 200)); // sample every few points
+      const projPts = getCachedCenterlineProj(projectionInfo, w, h);
 
       ctx.beginPath();
       ctx.strokeStyle = color;
       ctx.lineWidth = 1.5;
       ctx.globalAlpha = 0.5;
       let started = false;
-      for (let j = 0; j < nPos; j += step) {
-        const projected = worldToCurvedCpr(projectionInfo.positions[j], projectionInfo, w, h);
-        if (!projected) { started = false; continue; }
-        if (!started) { ctx.moveTo(projected[0], projected[1]); started = true; }
-        else { ctx.lineTo(projected[0], projected[1]); }
+      for (const p of projPts) {
+        if (!p) { started = false; continue; }
+        if (!started) { ctx.moveTo(p[0], p[1]); started = true; }
+        else { ctx.lineTo(p[0], p[1]); }
       }
       ctx.stroke();
       ctx.globalAlpha = 1.0;
@@ -442,8 +510,8 @@
         // Seeds are in [x,y,z] world coords; projection expects [z,y,x]
         const seedZyx: [number, number, number] = [seedPos[2], seedPos[1], seedPos[0]];
 
-        const projected = cprMode === 'curved'
-          ? worldToCurvedCpr(seedZyx, projectionInfo, w, h)
+        const projected = cprMode === 'stretched'
+          ? worldToStretchedCpr(seedZyx, projectionInfo, w, h)
           : worldToStraightenedCpr(seedZyx, projectionInfo, w, h);
 
         if (!projected) continue;
@@ -478,7 +546,7 @@
         ctx.stroke();
 
         // Index label
-        ctx.font = 'bold 9px -apple-system, sans-serif';
+        ctx.font = 'bold 11px -apple-system, sans-serif';
         ctx.textAlign = 'center';
         ctx.fillStyle = 'white';
         ctx.fillText(`${i}`, cx, cy - radius - 3);
@@ -488,25 +556,53 @@
     // Mode badge removed — toolbar already shows the mode.
   }
 
-  /** Full re-render: image + overlays. */
-  function repaintCanvas() {
-    if (!cprCanvas || !cprImageData) return;
-    renderCprToCanvas(
-      cprCanvas,
-      cprImageData,
-      cprWidth,
-      cprHeight,
-      windowCenter,
-      windowWidth,
-    );
-    drawOverlays(cprCanvas);
+  // ---- Two-canvas compositor ----
+  //
+  // The old single-canvas repaint ran a 260k–520k pixel RGBA loop on every
+  // mousemove (hover / seed drag / needle position change) because the
+  // `$effect` that painted the image also depended on overlay state. Moving
+  // the slider felt like ~30-60 ms per frame on the main thread.
+  //
+  // Now the HU→gray loop writes to a hidden buffer canvas once per image
+  // change (W/L, FAI, new render). All overlay-only updates just
+  // `drawImage(buffer)` + redraw overlays, which is ~1 ms regardless of
+  // image size.
+
+  /** Hidden buffer canvas that holds the rendered CPR image pixels. */
+  let bufferCanvas: HTMLCanvasElement | null = null;
+  /** True once `bufferCanvas` has image content matching current cprImageData. */
+  let bufferReady = false;
+
+  function ensureBuffer(w: number, h: number): HTMLCanvasElement {
+    if (!bufferCanvas) bufferCanvas = document.createElement('canvas');
+    if (bufferCanvas.width !== w) bufferCanvas.width = w;
+    if (bufferCanvas.height !== h) bufferCanvas.height = h;
+    return bufferCanvas;
   }
 
-  // Re-render when FAI overlay is toggled (uses cached image data)
-  $effect(() => {
-    showFaiOverlay; // track dependency
-    repaintCanvas();
-  });
+  /** Paint raw HU data through the window/level + FAI transform into the buffer. */
+  function paintImageToBuffer() {
+    if (!cprImageData) {
+      bufferReady = false;
+      return;
+    }
+    const buf = ensureBuffer(cprWidth, cprHeight);
+    renderCprToCanvas(buf, cprImageData, cprWidth, cprHeight, windowCenter, windowWidth);
+    bufferReady = true;
+  }
+
+  /** Fast path: blit the buffer to the visible canvas, then draw overlays. */
+  function compositeToMain() {
+    if (!cprCanvas) return;
+    if (!bufferReady || !bufferCanvas) return;
+    // Keep the visible canvas's pixel dims in sync with the buffer so the
+    // blit is 1:1 (no sub-pixel blur, no implicit resampling).
+    if (cprCanvas.width !== bufferCanvas.width) cprCanvas.width = bufferCanvas.width;
+    if (cprCanvas.height !== bufferCanvas.height) cprCanvas.height = bufferCanvas.height;
+    const ctx = cprCanvas.getContext('2d')!;
+    ctx.drawImage(bufferCanvas, 0, 0);
+    drawOverlays(cprCanvas);
+  }
 
   // ---- Phase 1: Build frame when centerline changes ----
 
@@ -585,8 +681,8 @@
     try {
       let buffer: ArrayBuffer;
 
-      if (cprMode === 'curved') {
-        buffer = await invoke<ArrayBuffer>('render_curved_cpr_image', {
+      if (cprMode === 'stretched') {
+        buffer = await invoke<ArrayBuffer>('render_stretched_cpr_image', {
           rotationDeg,
           widthMm: CPR_WIDTH_MM,
           pixelsWide: 512,
@@ -636,33 +732,49 @@
     }
   }
 
-  // Re-render canvas when image data, W/L, needle positions change
+  // Image-level changes: raw HU data, W/L window, FAI colour overlay — these
+  // all require re-running the per-pixel transform, so repaint the buffer
+  // and composite.
   $effect(() => {
-    // Touch reactive deps so Svelte tracks them for this effect
     void cprImageData;
     void windowCenter;
     void windowWidth;
+    void showFaiOverlay;
+
+    paintImageToBuffer();
+    compositeToMain();
+  });
+
+  // Overlay-only changes: seed dots, needle lines, arclength ticks, hover
+  // highlight, ostium marker, projection mode. None of these touch pixel
+  // values, so we skip `paintImageToBuffer` entirely and just blit + draw
+  // overlays (~1 ms vs the old ~30–60 ms).
+  $effect(() => {
     void needleAFraction;
     void needleBFraction;
     void needleCFraction;
     void arclengths;
     void cprMode;
-    // Track seed state for centerline overlay dots
     void seedStore.activeVesselData;
     void seedStore.selectedSeedIndex;
-    // Track ostium for overlay update
     void activeOstiumFrac;
-    // Track projection info for seed overlay
     void projectionInfo;
     void hoverSeedIndex;
 
-    repaintCanvas();
+    compositeToMain();
   });
 
   // ---- Cross-section computation (uses cached frame, raw binary) ----
 
-  let xsDebounce: ReturnType<typeof setTimeout> | undefined;
-  let computingXs = false;
+  // Cross-section updates were on a 100 ms debounce — that means the three
+  // panels sit frozen during a scroll and only update once the user stops.
+  // Feels sluggish. Switch to leading-edge + in-flight-pipeline: fire
+  // immediately, and if more needle/rotation changes arrive while the IPC
+  // is still in flight, remember the latest one and fire once when the
+  // previous completes. This gives real-time XS updates at whatever rate
+  // the IPC round-trip allows (typically ~15–25 ms in release), without
+  // queuing up stale requests.
+  let xsPending = false;
 
   $effect(() => {
     // Track needle and rotation deps
@@ -678,17 +790,25 @@
       return;
     }
 
-    clearTimeout(xsDebounce);
-    xsDebounce = setTimeout(() => {
-      renderCrossSections();
-    }, 100);
-
-    return () => clearTimeout(xsDebounce);
+    kickCrossSections();
   });
 
+  function kickCrossSections() {
+    if (!frameReady) return;
+    if (computingXs) {
+      // An IPC is already in flight; just note that inputs changed. The
+      // in-flight call's `finally` will re-fire with the newest values.
+      xsPending = true;
+      return;
+    }
+    void renderCrossSections();
+  }
+
+  let computingXs = false;
   async function renderCrossSections() {
     if (!frameReady || computingXs) return;
     computingXs = true;
+    xsPending = false;
     try {
       const buffer = await invoke<ArrayBuffer>('render_cross_sections', {
         positionFractions: [needleAFraction, needleBFraction, needleCFraction],
@@ -707,6 +827,14 @@
       console.error('CprView: render_cross_sections failed', e);
     } finally {
       computingXs = false;
+      // If any needle/rotation change arrived while we were in flight,
+      // re-fire now with the latest values. This is the "trailing" edge
+      // of the leading-edge pipeline and keeps the XS panels fresh at
+      // whatever rate the IPC round-trip allows.
+      if (xsPending) {
+        xsPending = false;
+        void renderCrossSections();
+      }
     }
   }
 
@@ -750,6 +878,75 @@
     navigateToWorldPos(pos);
   }
 
+  // Mousemove / wheel fire *much* faster than cornerstone3D can re-render
+  // the three MPR viewports. Each `navigateToWorldPos` call does
+  // setCamera + render on all three, which on a CCTA volume is ~15–30 ms
+  // of real WebGL work per call. Raw 60 Hz would ask for 1200 ms/sec of
+  // MPR work, which is obviously impossible — the main thread stalls and
+  // the UI drops frames.
+  //
+  // Throttle-with-leading-and-trailing: first scroll event fires
+  // immediately so the MPR viewports start tracking; subsequent events
+  // within the throttle interval are coalesced into a single trailing
+  // call scheduled at the next interval boundary. This way the MPR
+  // updates at ~7 fps during active scroll (continuous feedback, not
+  // frozen), and always snaps to the final position on release.
+  //
+  // 140 ms ≈ 7 fps. Each navigate costs ~20 ms of WebGL, so this keeps
+  // MPR overhead at ~15 % of the main thread while the user is actively
+  // scrolling — enough headroom for the CPR overlay + cross-section
+  // pipeline to stay smooth.
+  const NAV_INTERVAL_MS = 140;
+  let lastNavTime = 0;
+  let navigateTimer: ReturnType<typeof setTimeout> | null = null;
+  function scheduleNavigate() {
+    const now = performance.now();
+    const elapsed = now - lastNavTime;
+    if (navigateTimer !== null) {
+      clearTimeout(navigateTimer);
+      navigateTimer = null;
+    }
+    if (elapsed >= NAV_INTERVAL_MS) {
+      // Leading edge: fire immediately so MPR starts tracking as soon as
+      // the user begins to scroll / drag.
+      lastNavTime = now;
+      navigateToNeedlePos();
+    } else {
+      // Trailing edge: schedule at the next interval boundary. This also
+      // covers the "scroll ended; fire one final call with the true
+      // final position" case.
+      navigateTimer = setTimeout(() => {
+        navigateTimer = null;
+        lastNavTime = performance.now();
+        navigateToNeedlePos();
+      }, NAV_INTERVAL_MS - elapsed);
+    }
+  }
+
+  // Precision touchpads fire wheel events at ~240 Hz. If we mutate
+  // `needleBFraction` on every one, the overlay `$effect` fires 240×/sec
+  // and `compositeToMain` (blit + draw overlays ≈ 5 ms) pegs the main
+  // thread. Coalesce state updates to animation-frame rate: wheel/drag
+  // handlers push into a non-reactive scratch variable, and we commit
+  // once per frame. Downstream effects then fire at most 60 Hz.
+  let pendingNeedleB: number | null = null;
+  let needleBFrame: number | null = null;
+  function commitNeedleB() {
+    needleBFrame = null;
+    if (pendingNeedleB === null) return;
+    const frac = Math.max(0, Math.min(1, pendingNeedleB));
+    pendingNeedleB = null;
+    if (frac !== needleBFraction) {
+      needleBFraction = frac;
+      scheduleNavigate();
+    }
+  }
+  function setNeedleBThrottled(fraction: number) {
+    pendingNeedleB = fraction;
+    if (needleBFrame !== null) return;
+    needleBFrame = requestAnimationFrame(commitNeedleB);
+  }
+
   // ---- Needle dragging ----
 
   let dragging = $state(false);
@@ -770,8 +967,8 @@
     for (let i = 0; i < data.seeds.length; i++) {
       const seedPos = data.seeds[i].position;
       const seedZyx: [number, number, number] = [seedPos[2], seedPos[1], seedPos[0]];
-      const projected = cprMode === 'curved'
-        ? worldToCurvedCpr(seedZyx, projectionInfo, w, h)
+      const projected = cprMode === 'stretched'
+        ? worldToStretchedCpr(seedZyx, projectionInfo, w, h)
         : worldToStraightenedCpr(seedZyx, projectionInfo, w, h);
       if (!projected) continue;
 
@@ -824,7 +1021,7 @@
         navigateToNeedlePos();
       }
     } else if (projectionInfo && cprCanvas) {
-      // Curved mode: find nearest centerline point to click position
+      // Stretched mode: find nearest centerline point to click position
       const canvasPixelX = (x / rect.width) * cprCanvas.width;
       const canvasPixelY = (y / rect.height) * cprCanvas.height;
       const nPos = projectionInfo.positions.length;
@@ -834,7 +1031,7 @@
       let bestIdx = 0;
       let bestDist = Infinity;
       for (let j = 0; j < nPos; j++) {
-        const projected = worldToCurvedCpr(projectionInfo.positions[j], projectionInfo, w, h);
+        const projected = worldToStretchedCpr(projectionInfo.positions[j], projectionInfo, w, h);
         if (!projected) continue;
         const dx = canvasPixelX - projected[0];
         const dy = canvasPixelY - projected[1];
@@ -862,8 +1059,8 @@
       const canvasPixelY = (y / rect.height) * cprCanvas.height;
 
       // Unproject to 3D
-      const worldZyx = cprMode === 'curved'
-        ? curvedCprToWorld(canvasPixelX, canvasPixelY, projectionInfo, cprCanvas.width, cprCanvas.height)
+      const worldZyx = cprMode === 'stretched'
+        ? stretchedCprToWorld(canvasPixelX, canvasPixelY, projectionInfo, cprCanvas.width, cprCanvas.height)
         : straightenedCprToWorld(canvasPixelX, canvasPixelY, projectionInfo, cprCanvas.width, cprCanvas.height);
 
       // Convert [z,y,x] back to [x,y,z] for seedStore
@@ -875,10 +1072,9 @@
     // Needle B dragging
     if (dragging) {
       if (cprMode === 'straightened') {
-        needleBFraction = Math.max(0, Math.min(1, x / rect.width));
+        setNeedleBThrottled(x / rect.width);
       }
-      // In curved mode, needle dragging isn't supported (use scroll instead)
-      navigateToNeedlePos();
+      // In stretched mode, needle dragging isn't supported (use scroll instead)
       return;
     }
 
@@ -920,11 +1116,13 @@
       }
       cprZoom = newZoom;
     } else {
-      // Scroll: move needle B
+      // Scroll: move needle B. Accumulate into the pending value (not
+      // `needleBFraction` directly) so the reactive graph only fires once
+      // per animation frame, no matter how many wheel events arrive.
       const sensitivity = 0.0003;
       const delta = -event.deltaY * sensitivity;
-      needleBFraction = Math.max(0, Math.min(1, needleBFraction + delta));
-      navigateToNeedlePos();
+      const base = pendingNeedleB ?? needleBFraction;
+      setNeedleBThrottled(base + delta);
     }
   }
 
@@ -1053,7 +1251,10 @@
             batchImageData={batchXsA?.imageData ?? null}
             batchPixels={batchXsA?.pixels ?? null}
             arcMmProp={batchXsA?.arc_mm ?? null}
+            vesselDiameterMm={batchXsA?.vesselDiameterMm ?? null}
+            vesselWall={batchXsA?.vesselWall ?? null}
             showFaiOverlay={showFaiOverlay}
+            arcOffsetMm={ostiumArcMm}
           />
         </div>
         <div class="flex min-h-0 flex-1 flex-col bg-black">
@@ -1068,7 +1269,10 @@
             batchImageData={batchXsB?.imageData ?? null}
             batchPixels={batchXsB?.pixels ?? null}
             arcMmProp={batchXsB?.arc_mm ?? null}
+            vesselDiameterMm={batchXsB?.vesselDiameterMm ?? null}
+            vesselWall={batchXsB?.vesselWall ?? null}
             showFaiOverlay={showFaiOverlay}
+            arcOffsetMm={ostiumArcMm}
           />
         </div>
         <div class="flex min-h-0 flex-1 flex-col bg-black">
@@ -1083,7 +1287,10 @@
             batchImageData={batchXsC?.imageData ?? null}
             batchPixels={batchXsC?.pixels ?? null}
             arcMmProp={batchXsC?.arc_mm ?? null}
+            vesselDiameterMm={batchXsC?.vesselDiameterMm ?? null}
+            vesselWall={batchXsC?.vesselWall ?? null}
             showFaiOverlay={showFaiOverlay}
+            arcOffsetMm={ostiumArcMm}
           />
         </div>
       {:else}
@@ -1114,7 +1321,16 @@
 
     <span class="text-[10px] text-text-secondary/40">|</span>
 
-    <!-- Curved / Straightened toggle -->
+    <!-- Stretched / Straightened toggle -->
+    <button
+      class="rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors
+        {cprMode === 'stretched'
+          ? 'bg-accent/20 text-accent'
+          : 'text-text-secondary/60 hover:text-text-secondary'}"
+      onclick={() => { cprMode = 'stretched'; }}
+    >
+      Stretched
+    </button>
     <button
       class="rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors
         {cprMode === 'straightened'
@@ -1123,15 +1339,6 @@
       onclick={() => { cprMode = 'straightened'; }}
     >
       Straightened
-    </button>
-    <button
-      class="rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors
-        {cprMode === 'curved'
-          ? 'bg-accent/20 text-accent'
-          : 'text-text-secondary/60 hover:text-text-secondary'}"
-      onclick={() => { cprMode = 'curved'; }}
-    >
-      Curved
     </button>
 
     <button

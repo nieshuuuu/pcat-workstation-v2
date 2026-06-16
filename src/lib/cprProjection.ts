@@ -3,7 +3,7 @@
  *
  * Maps between 3-D world coordinates ([z, y, x] ordering, consistent with
  * the Rust backend) and 2-D canvas coordinates for both straightened and
- * curved CPR views.
+ * stretched CPR views.
  */
 
 // ---------------------------------------------------------------------------
@@ -12,13 +12,21 @@
 
 export type CprProjectionInfo = {
   total_arc_mm: number;
+  total_proj_arc_mm: number;
   half_width_mm: number;
-  view_right: [number, number, number];
-  view_up: [number, number, number];
-  view_center: [number, number, number];
-  bbox_mm: [number, number, number, number]; // [min_x, max_x, min_y, max_y]
-  positions: [number, number, number][];
+  projection_normal: [number, number, number];
+  mid_height_point: [number, number, number];
+  dy_mm: number;
+  pixels_wide: number;
+  pixels_high: number;
+  /**
+   * Lookup table for `worldToStretchedCpr`, uniformly sampled in projected
+   * arc-length. Its length is independent of the render resolution — the
+   * backend caps it (~128) so per-seed projection stays cheap.
+   */
+  proj_col_pts: [number, number, number][];
   arclengths: number[];
+  positions: [number, number, number][];
   normals: [number, number, number][];
 };
 
@@ -121,44 +129,72 @@ export function worldToStraightenedCpr(
 }
 
 // ---------------------------------------------------------------------------
-// 2. World -> Curved CPR
+// 2. World -> Stretched CPR
 // ---------------------------------------------------------------------------
 
 /**
- * Map a 3-D world position to curved CPR canvas coordinates.
+ * Map a 3-D world position to stretched CPR canvas coordinates.
  *
  * Returns `[canvasX, canvasY]` or `null` when the projected point falls
  * outside the canvas.
  */
-export function worldToCurvedCpr(
+export function worldToStretchedCpr(
   worldZyx: [number, number, number],
   info: CprProjectionInfo,
   canvasW: number,
   canvasH: number,
 ): [number, number] | null {
-  const { view_center, view_right, view_up, bbox_mm } = info;
+  const { projection_normal, mid_height_point, dy_mm, pixels_high, proj_col_pts } = info;
+  const n_cols = proj_col_pts.length;
+  if (n_cols < 2) return null;
 
-  // 1. Offset from view center.
-  const offset = sub3(worldZyx, view_center);
+  // 1. Depth along projection_normal (signed distance from mid-height plane).
+  const offset = sub3(worldZyx, mid_height_point);
+  const depth = dot3(offset, projection_normal);
 
-  // 2. Project onto viewing plane.
-  const x_mm = dot3(offset, view_right);
-  const y_mm = dot3(offset, view_up);
+  // 2. Project onto the mid-height plane.
+  const worldProj: [number, number, number] = [
+    worldZyx[0] - depth * projection_normal[0],
+    worldZyx[1] - depth * projection_normal[1],
+    worldZyx[2] - depth * projection_normal[2],
+  ];
 
-  // 3. Map mm -> canvas pixels via bbox.
-  const bboxW = bbox_mm[1] - bbox_mm[0];
-  const bboxH = bbox_mm[3] - bbox_mm[2];
-  if (bboxW === 0 || bboxH === 0) return null;
+  // 3. Find the column by projecting worldProj onto each segment of proj_col_pts
+  //    and choosing the segment with the smallest perpendicular distance.
+  let bestFracIdx = 0;
+  let bestPerpDistSq = Infinity;
 
-  const canvasX = ((x_mm - bbox_mm[0]) / bboxW) * (canvasW - 1);
-  const canvasY = ((bbox_mm[3] - y_mm) / bboxH) * (canvasH - 1);
+  for (let i = 0; i < n_cols - 1; i++) {
+    const a = proj_col_pts[i];
+    const b = proj_col_pts[i + 1];
+    const ab: [number, number, number] = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    const ap: [number, number, number] = [worldProj[0] - a[0], worldProj[1] - a[1], worldProj[2] - a[2]];
+    const abLenSq = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    if (abLenSq === 0) continue;
+    const t = Math.max(0, Math.min(1, (ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / abLenSq));
+    // Closest point on segment to worldProj
+    const closest: [number, number, number] = [a[0] + t * ab[0], a[1] + t * ab[1], a[2] + t * ab[2]];
+    const perpDistSq = distSq3(worldProj, closest);
+    if (perpDistSq < bestPerpDistSq) {
+      bestPerpDistSq = perpDistSq;
+      bestFracIdx = i + t;
+    }
+  }
 
-  // 4. Bounds check.
+  const colFrac = bestFracIdx / (n_cols - 1);
+  const canvasX = colFrac * canvasW;
+
+  // 4. Vertical: invert the renderer's row formula.
+  // renderer: y_offset_mm = (pixels_high / 2 - row_image) * dy_mm  =>  row_image = pixels_high / 2 - depth / dy_mm
+  const rowImage = pixels_high / 2 - depth / dy_mm;
+  const canvasY = (rowImage / pixels_high) * canvasH;
+
+  // 5. Bounds check with margin.
   if (
     canvasX < -MARGIN_PX ||
-    canvasX > canvasW - 1 + MARGIN_PX ||
+    canvasX > canvasW + MARGIN_PX ||
     canvasY < -MARGIN_PX ||
-    canvasY > canvasH - 1 + MARGIN_PX
+    canvasY > canvasH + MARGIN_PX
   ) {
     return null;
   }
@@ -210,32 +246,36 @@ export function straightenedCprToWorld(
 }
 
 // ---------------------------------------------------------------------------
-// 4. Curved CPR -> World
+// 4. Stretched CPR -> World
 // ---------------------------------------------------------------------------
 
 /**
- * Map a curved CPR canvas position back to 3-D world coordinates.
- *
- * The reconstruction lies on the viewing plane defined by `view_center`,
- * `view_right`, and `view_up`.
+ * Map a stretched CPR canvas position back to 3-D world coordinates.
  */
-export function curvedCprToWorld(
+export function stretchedCprToWorld(
   canvasX: number,
   canvasY: number,
   info: CprProjectionInfo,
   canvasW: number,
   canvasH: number,
 ): [number, number, number] {
-  const { view_center, view_right, view_up, bbox_mm } = info;
+  const { projection_normal, dy_mm, pixels_high, proj_col_pts } = info;
+  const n_cols = proj_col_pts.length;
 
-  // 1. Canvas pixels -> mm in viewing plane.
-  const x_mm = bbox_mm[0] + (canvasX / (canvasW - 1)) * (bbox_mm[1] - bbox_mm[0]);
-  const y_mm = bbox_mm[3] - (canvasY / (canvasH - 1)) * (bbox_mm[3] - bbox_mm[2]);
+  // 1. Canvas X -> interpolated point on proj_col_pts.
+  const colFrac = canvasX / canvasW;
+  const floatIdx = colFrac * (n_cols - 1);
+  const i0 = Math.max(0, Math.min(n_cols - 2, Math.floor(floatIdx)));
+  const t = floatIdx - i0;
+  const projPt = lerp3(proj_col_pts[i0], proj_col_pts[i0 + 1], t);
 
-  // 2. Reconstruct 3-D position on the viewing plane.
+  // 2. Canvas Y -> depth offset along projection_normal.
+  const rowImage = (canvasY / canvasH) * pixels_high;
+  const y_offset_mm = (pixels_high / 2 - rowImage) * dy_mm;
+
   return [
-    view_center[0] + x_mm * view_right[0] + y_mm * view_up[0],
-    view_center[1] + x_mm * view_right[1] + y_mm * view_up[1],
-    view_center[2] + x_mm * view_right[2] + y_mm * view_up[2],
+    projPt[0] + y_offset_mm * projection_normal[0],
+    projPt[1] + y_offset_mm * projection_normal[1],
+    projPt[2] + y_offset_mm * projection_normal[2],
   ];
 }

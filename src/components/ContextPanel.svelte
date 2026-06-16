@@ -10,6 +10,7 @@
   import CprView from './CprView.svelte';
   import AnalysisDashboard from './AnalysisDashboard.svelte';
   import { pipelineStore } from '$lib/stores/pipelineStore.svelte';
+  import { uiStore } from '$lib/stores/uiStore.svelte';
 
   type Props = {
     phase: 'empty' | 'dicom' | 'seeds' | 'analysis';
@@ -23,11 +24,26 @@
   let hasResults = $derived(pipelineStore.status === 'complete');
   let hasCpr = $derived(phase === 'seeds' || phase === 'analysis');
 
+  // Fullscreen the Analysis dashboard — it's otherwise confined to this narrow
+  // side panel, which is too cramped for the radial/angular charts. The flag
+  // lives in uiStore so App's root keydown handler owns Escape: closing the
+  // overlay there can't also fire App's "clear vessel" shortcut. (A local
+  // window keydown here couldn't prevent that — App's listener is on the same
+  // window target and runs regardless of stopPropagation.)
+  let maximized = $derived(uiStore.analysisMaximized);
+
   // Auto-switch to analysis tab when pipeline first completes
   $effect(() => {
     if (pipelineStore.status === 'complete') {
       contextTab = 'analysis';
     }
+  });
+
+  // Never leave the overlay stuck open once its results are gone (centerline
+  // cleared, patient switched): otherwise the NEXT completed pipeline would pop
+  // straight into fullscreen unrequested.
+  $effect(() => {
+    if (!hasResults) uiStore.analysisMaximized = false;
   });
 </script>
 
@@ -124,12 +140,28 @@
         >
           Analysis <span class="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-success"></span>
         </button>
+
+        {#if contextTab === 'analysis'}
+          <button
+            class="ml-auto px-2.5 text-xs font-medium text-text-secondary transition-colors hover:text-accent"
+            onclick={() => (uiStore.analysisMaximized = true)}
+            title="Fullscreen analysis"
+            aria-label="Fullscreen analysis"
+          >
+            ⤢
+          </button>
+        {/if}
       </div>
     {/if}
 
-    <!-- Content -->
+    <!-- Content. When maximized, the dashboard renders in the overlay below
+         instead, so it mounts exactly once (one Plotly instance). -->
     <div class="min-h-0 flex-1">
-      {#if hasResults && contextTab === 'analysis'}
+      {#if maximized && hasResults && contextTab === 'analysis'}
+        <div class="flex h-full items-center justify-center text-xs text-text-secondary/60">
+          Analysis shown fullscreen — press Esc or Close to return.
+        </div>
+      {:else if hasResults && contextTab === 'analysis'}
         <AnalysisDashboard />
       {:else}
         <CprView />
@@ -137,3 +169,24 @@
     </div>
   {/if}
 </div>
+
+<!-- Fullscreen Analysis overlay -->
+{#if maximized && hasResults}
+  <div class="fixed inset-0 z-50 flex flex-col bg-surface">
+    <div class="flex shrink-0 items-center justify-between border-b border-border bg-surface-secondary px-4 py-2">
+      <span class="text-sm font-semibold text-text-primary">
+        FAI Analysis <span class="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-success"></span>
+      </span>
+      <button
+        class="rounded bg-surface-tertiary px-3 py-1 text-xs font-medium text-text-primary hover:bg-surface-tertiary/80"
+        onclick={() => (uiStore.analysisMaximized = false)}
+        title="Exit fullscreen (Esc)"
+      >
+        ✕ Close
+      </button>
+    </div>
+    <div class="min-h-0 flex-1">
+      <AnalysisDashboard />
+    </div>
+  </div>
+{/if}

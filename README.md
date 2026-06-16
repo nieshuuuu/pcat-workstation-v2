@@ -1,6 +1,6 @@
 # PCAT Workstation
 
-A desktop application for measuring **Fat Attenuation Index (FAI)** around coronary arteries from cardiac CT scans. FAI quantifies pericoronary adipose tissue inflammation — a biomarker for coronary artery disease risk.
+A desktop application for analyzing **pericoronary adipose tissue** from cardiac CT scans. It measures the **Fat Attenuation Index (FAI)** — a biomarker of coronary inflammation and cardiovascular risk — and, on dual-energy / spectral scans, performs **water/lipid material decomposition** to quantify the tissue composition around each artery.
 
 **Author:** [Shu Nie](https://github.com/nieshuuuu) · University of California, Irvine
 
@@ -42,7 +42,7 @@ Select a vessel (RCA, LAD, or LCx) from the toolbar, then **click on the MPR vie
 - **Drag** a seed to adjust its position
 - **Delete/Backspace** removes the selected seed
 - **Cmd+Z** to undo, **Cmd+Shift+Z** to redo
-- Click **Save** to store your work (auto-loads next time you open this patient)
+- Click **Save** to store your work, and **Load** to restore it later (see [Save and restore everything](#8-save-and-restore-everything))
 
 ### 4. Review the CPR
 
@@ -96,12 +96,22 @@ Cross-sectional ring showing mean HU in 8 sectors around the vessel. Identifies 
 |:---:|:---:|
 | ![Angular — RCA](docs/screenshots/analysis-angular-rca.jpg) | ![Angular — LAD](docs/screenshots/analysis-angular-lad.jpg) |
 
-### 7. Save and compare
+### 7. Water/Lipid tissue analysis (dual-energy)
 
-- Click **Save** to store seeds + analysis results together
-- You can trace multiple vessels (RCA, LAD, LCx) and run the pipeline for each
-- Switch between CPR and Analysis tabs anytime — your MPR views stay visible
-- Click **Re-analyze** after adjusting seeds to update results
+On dual-energy or spectral CT, the **MMD Analysis** tab decomposes soft tissue into **water** and **lipid** components — a quantitative complement to FAI that is less sensitive to scanner and kV settings.
+
+- Open the **Water/Lipid** tab first: it self-calibrates from the patient's own fat and muscle (no external phantom needed).
+- The **MMD Analysis** tab then shows each coronary cross-section as a material map over the CT, alongside a smoothed 3D surface of the pericoronary ring.
+- **Hover** over the cross-section to read the value under your cursor with its uncertainty — e.g. `Water 0.83 ± 0.07` (volume fraction) or `Water 830 ± 70 mg/mL` (mass density) — matching the material/unit you select at the bottom left (water, lipid, or total density; fraction or mg/mL).
+- Sections whose ring contains no soft tissue are labelled rather than left blank.
+- **Export CSV** writes the per-section water/lipid/density quantification for every cross-section.
+
+### 8. Save and restore everything
+
+- Click **Save** — from either the Editor toolbar or the MMD Analysis view — to store **everything for this patient in one file**: seed points, FAI analysis results, and the water/lipid quantification.
+- Click **Load** to restore a saved session — the FAI dashboard, seeds, and water/lipid results all come back without re-running.
+- On the **Analysis** tab, the **⤓ Export** button writes the FAI results to CSV (per-vessel summary + radial profile + angular sectors) and a complete JSON — ready for a spreadsheet or report.
+- You can trace multiple vessels (RCA, LAD, LCx) and analyze each; re-run after adjusting seeds to update results.
 
 ---
 
@@ -155,7 +165,7 @@ cargo tauri dev
 cargo tauri build
 ```
 
-Output: `src-tauri/target/release/bundle/dmg/PCAT Workstation_0.1.0_aarch64.dmg`
+Output: `src-tauri/target/release/bundle/dmg/PCAT Workstation_0.2.0_aarch64.dmg`
 
 ### Tech stack
 Tauri v2 (Rust) + Svelte 5 + cornerstone3D + Plotly.js

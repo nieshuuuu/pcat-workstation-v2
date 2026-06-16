@@ -98,6 +98,25 @@
 
     // Register the imperative navigation function for the shared service
     registerNavigate(navigateToWorldPos);
+
+    // ---------- Notify cornerstone of viewport element size changes ----------
+    // Without this, opening dev tools / dragging the window edge causes the
+    // viewport DOM to shrink while cornerstone keeps using the original canvas
+    // size, so canvasToWorld returns wildly wrong world coords.
+    const resizeObserver = new ResizeObserver(() => {
+      try {
+        const e = getRenderingEngine();
+        e.resize(true, false); // immediate, don't reset camera
+      } catch {
+        // engine may not be ready yet — safe to ignore
+      }
+    });
+    for (const el of [axialEl, coronalEl, sagittalEl]) {
+      if (el) resizeObserver.observe(el);
+    }
+    // Cleanup on unmount
+    (window as any).__pcatMprResizeObserver?.disconnect?.();
+    (window as any).__pcatMprResizeObserver = resizeObserver;
   });
 
   // ---------- React to volume changes ----------
@@ -106,13 +125,41 @@
     if (!csVolumeId || !engineReady) return;
 
     const engine = getRenderingEngine();
+    const _tBind = performance.now();
 
     setVolumesForViewports(
       engine,
       [{ volumeId: csVolumeId }],
       VIEWPORT_IDS,
     ).then(() => {
+      // Apply slab thickness to coronal/sagittal AFTER volume is bound.
+      // Use the volume's native slice spacing (sz) as the slab — this is
+      // the exact resolution of slice positions, so the slab covers
+      // exactly one slice's worth of data. That's enough to mask the
+      // discrete-voxel snap (~0.07mm subpixel offset) without averaging
+      // unrelated anatomy. For NAEOTOM 0.35mm slices the slab is 0.35mm;
+      // for thicker 0.8mm CCTA recons the slab is 0.8mm. Axial is left
+      // thin since it's the native acquisition direction.
+      try {
+        // volumeStore.spacing is [sz, sy, sx] from the Rust loader.
+        const sz = volumeStore.current?.spacing?.[0] ?? 1.0;
+        const slabMm = Math.max(0.35, Math.min(sz, 1.0));
+        for (const id of [VP_CORONAL, VP_SAGITTAL]) {
+          const vp = engine.getViewport(id) as any;
+          if (vp?.setSlabThickness) {
+            vp.setSlabThickness(slabMm);
+          }
+          if (vp?.setBlendMode && (Enums as any).BlendModes?.AVERAGE_INTENSITY_BLEND !== undefined) {
+            vp.setBlendMode((Enums as any).BlendModes.AVERAGE_INTENSITY_BLEND);
+          }
+        }
+      } catch (e) {
+        console.warn('MprPanel: failed to set slab', e);
+      }
       engine.renderViewports(VIEWPORT_IDS);
+      console.log(
+        `[load-timing] MPR setVolumesForViewports + render (cornerstone GPU upload) = ${(performance.now() - _tBind) | 0}ms`,
+      );
     });
   });
 

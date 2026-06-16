@@ -241,7 +241,7 @@
   /**
    * Handle mousedown on the viewport — three-zone click detection + drag initiation.
    */
-  function handleMouseDown(event: MouseEvent) {
+  async function handleMouseDown(event: MouseEvent) {
     // Only handle left clicks without modifier keys
     if (event.button !== 0) return;
     if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
@@ -300,6 +300,33 @@
 
     seedStore.addSeed(worldPos);
     navigateToWorldPos(worldPos);
+
+    // --- Debug: verify world coord is consistent across all 3 viewports ---
+    // Remove once the subtle-offset bug is resolved.
+    try {
+      const engine = getRenderingEngine();
+      const ids = ['vp-axial', 'vp-coronal', 'vp-sagittal'];
+      const rows: Record<string, unknown>[] = [];
+      for (const vpId of ids) {
+        const v = engine.getViewport(vpId);
+        if (!v) continue;
+        const cam = v.getCamera();
+        const canvas = v.worldToCanvas(worldPos as [number, number, number]);
+        rows.push({
+          vp: vpId,
+          focal: cam.focalPoint,
+          normal: cam.viewPlaneNormal,
+          seedCanvas: canvas,
+        });
+      }
+      console.log('[seed-place]', {
+        world: worldPos,
+        clicked: orientation,
+        views: rows,
+      });
+    } catch (e) {
+      console.warn('[seed-place] debug failed', e);
+    }
   }
 
   /**

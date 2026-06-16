@@ -1,0 +1,6 @@
+[workspace]
+members = ["crates/pcat-pipeline", "src-tauri"]
+resolver = "2"
+
+[profile.dev]
+opt-level = 2

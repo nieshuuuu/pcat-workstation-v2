@@ -4,10 +4,9 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
-use crate::pipeline::centerline;
-use crate::pipeline::contour;
-use crate::pipeline::stats::FaiStats;
-use crate::pipeline::voi;
+use pcat_pipeline::centerline;
+use pcat_pipeline::contour;
+use pcat_pipeline::stats::FaiStats;
 use crate::state::{AnalysisResults, AppState, Vessel, VesselResult};
 
 /// Seed points and segment specification for a single vessel.
@@ -48,6 +47,7 @@ fn build_dense_centerline(
     waypoints_mm: &[[f64; 3]],
     spacing: [f64; 3],
     origin: [f64; 3],
+    direction: &[f64; 9],
     step_mm: f64,
 ) -> Vec<[f64; 3]> {
     // Collect all control points in order: ostium, then waypoints
@@ -59,14 +59,12 @@ fn build_dense_centerline(
         return control_pts;
     }
 
-    // Convert mm to voxel coords: voxel = (mm - origin) / spacing
+    // Convert mm → voxel through the IOP-aware helper so non-axial acquisitions
+    // (rare but possible) don't silently mis-locate the centerline.
+    let inv_spacing = [1.0 / spacing[0], 1.0 / spacing[1], 1.0 / spacing[2]];
     let control_vox: Vec<[f64; 3]> = control_pts
         .iter()
-        .map(|pt| [
-            (pt[0] - origin[0]) / spacing[0],
-            (pt[1] - origin[1]) / spacing[1],
-            (pt[2] - origin[2]) / spacing[2],
-        ])
+        .map(|pt| pcat_pipeline::types::patient_to_voxel(*pt, origin, inv_spacing, direction))
         .collect();
 
     // Densely interpolate between consecutive control points at step_mm intervals
@@ -123,20 +121,14 @@ pub async fn run_pipeline(
     }
 
     // Extract volume data under the lock, then release immediately
-    let (volume_data, spacing, origin) = {
+    let (volume_data, spacing, origin, direction) = {
         let guard = state.lock().map_err(|e| format!("lock poisoned: {e}"))?;
         let vol = guard
             .volume
             .as_ref()
             .ok_or_else(|| "no volume loaded".to_string())?;
-        (vol.data.clone(), vol.spacing, vol.origin)
+        (vol.data.clone(), vol.spacing, vol.origin, vol.direction)
     };
-
-    let volume_shape = [
-        volume_data.shape()[0],
-        volume_data.shape()[1],
-        volume_data.shape()[2],
-    ];
 
     let seeds_clone = seeds.clone();
     let app_clone = app.clone();
@@ -171,6 +163,7 @@ pub async fn run_pipeline(
                 &vessel_seeds.waypoints_mm,
                 spacing,
                 origin,
+                &direction,
                 0.5, // 0.5mm step
             );
 
@@ -226,16 +219,6 @@ pub async fn run_pipeline(
                 continue;
             }
 
-            // --- Stage 3: Estimate radii ---
-            emit_progress("radii", 0.2);
-
-            let radii = centerline::estimate_radii(
-                &volume_data,
-                &clipped,
-                spacing,
-                (150.0, 1200.0),
-            );
-
             // --- Stage 4: Extract contours ---
             emit_progress("contours", 0.3);
 
@@ -248,58 +231,26 @@ pub async fn run_pipeline(
                 5.0,  // sigma_deg
             );
 
-            // --- Stage 5: Build VOI ---
-            emit_progress("voi", 0.6);
-
-            let voi_mask = voi::build_voi(
-                volume_shape,
-                &contours,
-                spacing,
-                voi::VoiMode::Crisp {
-                    gap_mm: 1.0,
-                    ring_mm: 3.0,
-                },
-            );
-
-            // --- Stage 6: Compute FAI stats ---
+            // --- Stage 5–8: FAI analysis ---
+            // One voxel pass derives the FAI summary, the radial profile, and
+            // the angular asymmetry from the SAME voxels, all referenced to the
+            // half-max contour (per-angle) with a 1 mm wall gap. The three
+            // dashboard views therefore reconcile by construction: the angular
+            // sectors and the in-band radial rings average back to the FAI mean.
             emit_progress("stats", 0.85);
 
-            let mut stats = crate::pipeline::stats::compute_pcat_stats(
+            let stats = pcat_pipeline::stats::compute_fai_analysis(
                 &volume_data,
-                &voi_mask,
+                &contours,
+                spacing,
                 vessel_name,
-                (-190.0, -30.0),
+                (-190.0, -30.0), // FAI fat HU window
+                1.0,             // gap_mm (CRISP-CT: skip the vessel wall)
+                3.0,             // ring_mm
+                8,               // n_sectors
+                20.0,            // max_distance_mm (radial-profile extent)
+                1.0,             // ring_step_mm
             );
-
-            // --- Stage 7: Radial profile ---
-            emit_progress("radial_profile", 0.92);
-
-            let radial = crate::pipeline::stats::compute_radial_profile(
-                &volume_data,
-                &clipped,
-                &radii,
-                spacing,
-                20.0,    // max_distance_mm
-                1.0,     // ring_step_mm
-                (-190.0, -30.0),
-            );
-
-            // --- Stage 8: Angular asymmetry ---
-            emit_progress("angular_asymmetry", 0.96);
-
-            let angular = crate::pipeline::stats::compute_angular_asymmetry(
-                &volume_data,
-                &clipped,
-                &radii,
-                spacing,
-                8,       // n_sectors
-                (-190.0, -30.0),
-                1.0,     // gap_mm (CRISP-CT)
-                3.0,     // ring_mm
-            );
-
-            stats.radial_profile = Some(radial);
-            stats.angular_asymmetry = Some(angular);
 
             emit_progress("done", 1.0);
             all_stats.insert(vessel_name.clone(), stats);

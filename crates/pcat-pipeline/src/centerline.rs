@@ -1,6 +1,6 @@
 use ndarray::Array3;
 
-use super::interp::trilinear;
+use crate::interp::trilinear;
 
 /// Clip centerline to proximal segment [start_mm, start_mm + length_mm].
 /// Input: centerline as voxel coords [z,y,x], spacing [sz,sy,sx].

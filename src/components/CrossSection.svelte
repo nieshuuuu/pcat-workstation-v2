@@ -2,9 +2,13 @@
   /**
    * Single cross-section canvas for a CPR needle position.
    *
-   * If `batchImageData` is provided (from parent batch computation as raw
-   * Float32Array), renders it directly. Otherwise falls back to invoking
-   * Rust individually (legacy base64 path).
+   * The cross-section image, lumen polygon and diameter are all computed
+   * in Rust (`pcat_pipeline::vessel_wall::compute_vessel_geometry`) and
+   * delivered via `batchImageData` / `vesselWall` / `vesselDiameterMm`
+   * from the parent. A legacy base64 fallback path is kept for robustness
+   * when batch data is unavailable; in that fallback the image still
+   * renders but no measurement overlay is shown (Rust is the sole source
+   * of truth for the measurement).
    */
   import { invoke } from '@tauri-apps/api/core';
 
@@ -22,8 +26,15 @@
     batchPixels?: number | null;
     /** Pre-computed arc-length in mm from batch call. */
     arcMmProp?: number | null;
+    /** Rust-computed lumen diameter in mm (FWHM per-ray scan). */
+    vesselDiameterMm?: number | null;
+    /** Rust-computed lumen polygon: flat [x0,y0,x1,y1,...] in pixel coords. */
+    vesselWall?: Float32Array | null;
     /** Whether to show FAI color overlay. */
     showFaiOverlay?: boolean;
+    /** Absolute arc-length (mm) of the ostium along the centerline.
+     *  Displayed arc = arc_mm - arcOffsetMm. */
+    arcOffsetMm?: number | null;
   };
 
   let {
@@ -37,17 +48,16 @@
     batchImageData = null,
     batchPixels = null,
     arcMmProp = null,
+    vesselDiameterMm = null,
+    vesselWall = null,
     showFaiOverlay = false,
+    arcOffsetMm = null,
   }: Props = $props();
 
   let canvas: HTMLCanvasElement | undefined = $state();
   let arcMm = $state<number | null>(null);
   let loading = $state(false);
   let pixels = $state(128);
-  let vesselDiameterMm = $state<number | null>(null);
-  // Measurement endpoints in pixel coords for visual overlay
-  let measH = $state<{ left: number; right: number; y: number } | null>(null);
-  let measV = $state<{ top: number; bottom: number; x: number } | null>(null);
 
   type CrossSectionResult = {
     image_base64: string;
@@ -97,61 +107,49 @@
   }
 
   /**
-   * Estimate vessel diameter from cross-section image.
-   * Uses valley detection: scans from center outward and stops at the
-   * first significant HU drop (vessel wall / gap between vessel and
-   * adjacent chamber). This prevents the measurement from extending
-   * through bright neighbouring structures like heart chambers.
+   * Horizontal / vertical caliper extents of the lumen polygon, in pixel
+   * coords. Derived from the polygon's bounding box through its centroid —
+   * a light visual echo of the diameter text.
    */
-  function measureVesselDiameter(data: Float32Array, sz: number): number | null {
-    const widthMm = 15.0;
-    const absoluteThreshold = 100;   // stop if HU drops below this
-    const gradientDrop = 100;         // stop if HU drops by this much vs previous pixel
-    const center = Math.floor(sz / 2);
+  type Caliper = {
+    h: { left: number; right: number; y: number };
+    v: { top: number; bottom: number; x: number };
+  };
 
-    /** Scan from center outward in one direction. Returns boundary pixel index. */
-    function findBoundary(startIdx: number, step: number, getHU: (idx: number) => number, limit: number): number {
-      let idx = startIdx;
-      let prevHU = getHU(startIdx);
-      // Only start scanning if center is bright enough
-      if (prevHU < absoluteThreshold) return startIdx;
-      idx += step;
-      while (idx > 0 && idx < limit - 1) {
-        const hu = getHU(idx);
-        if (hu < absoluteThreshold) return idx;
-        if (prevHU - hu > gradientDrop) return idx;
-        prevHU = hu;
-        idx += step;
-      }
-      return idx;
+  function polygonCaliper(wall: Float32Array): Caliper | null {
+    const n = wall.length / 2;
+    if (n < 3) return null;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    let sumX = 0, sumY = 0;
+    for (let i = 0; i < n; i++) {
+      const x = wall[2 * i];
+      const y = wall[2 * i + 1];
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      sumX += x;
+      sumY += y;
     }
-
-    // Horizontal scan
-    const getHUh = (col: number) => data[center * sz + col];
-    let left = findBoundary(center, -1, getHUh, sz);
-    let right = findBoundary(center, 1, getHUh, sz);
-    const hDiamPx = right - left;
-
-    // Vertical scan
-    const getHUv = (row: number) => data[row * sz + center];
-    let top = findBoundary(center, -1, getHUv, sz);
-    let bottom = findBoundary(center, 1, getHUv, sz);
-    const vDiamPx = bottom - top;
-
-    const avgDiamPx = (hDiamPx + vDiamPx) / 2;
-    if (avgDiamPx < 2) {
-      measH = null;
-      measV = null;
-      return null;
-    }
-
-    // Store pixel positions for visual overlay
-    measH = { left, right, y: center };
-    measV = { top, bottom, x: center };
-
-    const mmPerPixel = (2 * widthMm) / sz;
-    return avgDiamPx * mmPerPixel;
+    return {
+      h: { left: minX, right: maxX, y: sumY / n },
+      v: { top: minY, bottom: maxY, x: sumX / n },
+    };
   }
+
+  let caliper = $derived.by<Caliper | null>(() =>
+    vesselWall ? polygonCaliper(vesselWall) : null,
+  );
+
+  let wallPolygonPoints = $derived.by<string | null>(() => {
+    if (!vesselWall || vesselWall.length < 6) return null;
+    const n = vesselWall.length / 2;
+    const parts: string[] = new Array(n);
+    for (let i = 0; i < n; i++) {
+      parts[i] = `${vesselWall[2 * i].toFixed(2)},${vesselWall[2 * i + 1].toFixed(2)}`;
+    }
+    return parts.join(' ');
+  });
 
   // --- Render pre-computed batch data when provided ---
   $effect(() => {
@@ -165,7 +163,6 @@
       pixels = sz;
       arcMm = am;
       renderToCanvas(canvas, imgData, sz, sz, wc, ww);
-      vesselDiameterMm = measureVesselDiameter(imgData, sz);
     }
   });
 
@@ -230,12 +227,7 @@
     </span>
     {#if arcMm !== null}
       <span class="text-[10px] tabular-nums text-text-secondary">
-        {arcMm.toFixed(1)} mm
-      </span>
-    {/if}
-    {#if vesselDiameterMm !== null}
-      <span class="text-[10px] tabular-nums" style="color: #facc15;">
-        {vesselDiameterMm.toFixed(1)} mm
+        {(arcMm - (arcOffsetMm ?? 0)).toFixed(1)} mm
       </span>
     {/if}
   </div>
@@ -257,28 +249,38 @@
   ></canvas>
 
   <!-- Diameter measurement overlay -->
-  {#if measH && measV && vesselDiameterMm !== null}
+  {#if caliper && wallPolygonPoints && vesselDiameterMm !== null}
     <svg class="pointer-events-none absolute inset-0 h-full w-full" viewBox="0 0 {pixels} {pixels}" preserveAspectRatio="xMidYMid meet">
+      <!-- Lumen boundary polygon (Rust FWHM per-ray) -->
+      <polygon
+        points={wallPolygonPoints}
+        fill="#22d3ee"
+        fill-opacity="0.1"
+        stroke="#22d3ee"
+        stroke-width="0.8"
+        stroke-opacity="0.8"
+      />
+
       <!-- Horizontal caliper -->
-      <line x1={measH.left} y1={measH.y} x2={measH.right} y2={measH.y}
+      <line x1={caliper.h.left} y1={caliper.h.y} x2={caliper.h.right} y2={caliper.h.y}
         stroke="#facc15" stroke-width="1" stroke-opacity="0.9" />
-      <line x1={measH.left} y1={measH.y - 3} x2={measH.left} y2={measH.y + 3}
+      <line x1={caliper.h.left} y1={caliper.h.y - 3} x2={caliper.h.left} y2={caliper.h.y + 3}
         stroke="#facc15" stroke-width="1" stroke-opacity="0.9" />
-      <line x1={measH.right} y1={measH.y - 3} x2={measH.right} y2={measH.y + 3}
+      <line x1={caliper.h.right} y1={caliper.h.y - 3} x2={caliper.h.right} y2={caliper.h.y + 3}
         stroke="#facc15" stroke-width="1" stroke-opacity="0.9" />
 
       <!-- Vertical caliper -->
-      <line x1={measV.x} y1={measV.top} x2={measV.x} y2={measV.bottom}
+      <line x1={caliper.v.x} y1={caliper.v.top} x2={caliper.v.x} y2={caliper.v.bottom}
         stroke="#facc15" stroke-width="1" stroke-opacity="0.9" />
-      <line x1={measV.x - 3} y1={measV.top} x2={measV.x + 3} y2={measV.top}
+      <line x1={caliper.v.x - 3} y1={caliper.v.top} x2={caliper.v.x + 3} y2={caliper.v.top}
         stroke="#facc15" stroke-width="1" stroke-opacity="0.9" />
-      <line x1={measV.x - 3} y1={measV.bottom} x2={measV.x + 3} y2={measV.bottom}
+      <line x1={caliper.v.x - 3} y1={caliper.v.bottom} x2={caliper.v.x + 3} y2={caliper.v.bottom}
         stroke="#facc15" stroke-width="1" stroke-opacity="0.9" />
 
       <!-- Diameter label -->
-      <text x={measH.right + 3} y={measH.y - 2}
+      <text x={caliper.h.right + 3} y={caliper.h.y - 2}
         fill="#facc15" font-size="9" font-family="-apple-system, sans-serif" font-weight="bold">
-        {vesselDiameterMm.toFixed(1)}
+        {vesselDiameterMm.toFixed(1)} mm
       </text>
     </svg>
   {/if}

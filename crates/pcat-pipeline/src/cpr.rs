@@ -1,8 +1,9 @@
 use nalgebra::Vector3;
 use ndarray::Array3;
+use rayon::prelude::*;
 
-use super::interp::trilinear;
-use crate::pipeline::spline::CubicSpline3D;
+use crate::interp::trilinear;
+use crate::spline::CubicSpline3D;
 
 /// Result of a CPR computation.
 #[derive(serde::Serialize)]
@@ -14,15 +15,8 @@ pub struct CprResult {
     pub arclengths: Vec<f64>, // pixels_wide entries, mm
 }
 
-/// Result of a curved CPR computation.
-pub struct CurvedCprResult {
-    /// Flattened row-major image, shape (pixels_high, pixels_wide).
-    /// Pixels outside the vessel field of view are NAN.
-    pub image: Vec<f32>,
-    pub pixels_wide: usize,
-    pub pixels_high: usize,
-    pub arclengths: Vec<f64>,
-}
+/// Re-export from stretched_cpr for use by the command layer.
+pub use crate::stretched_cpr::StretchedCprResult;
 
 /// Result of a cross-section computation.
 #[derive(serde::Serialize)]
@@ -30,7 +24,17 @@ pub struct CrossSectionResult {
     pub image: Vec<f32>,  // pixels x pixels, row-major
     pub pixels: usize,
     pub arc_mm: f64,      // arc-length position
+    /// Equivalent-circle lumen diameter in mm, from a per-ray FWHM scan
+    /// anchored at the image centre. See `vessel_wall::compute_vessel_geometry`.
+    pub vessel_diameter_mm: f64,
+    /// Lumen boundary polygon `[x, y]` in image pixel coords, one point per
+    /// angle starting at θ = 0.
+    pub vessel_wall: Vec<[f64; 2]>,
 }
+
+/// Number of rays used for the lumen boundary on cross-sections. Matches the
+/// annotation-side default so both UI surfaces show the same contour.
+pub const CROSS_SECTION_N_ANGLES: usize = 72;
 
 // ---------------------------------------------------------------------------
 // CprFrame — precomputed per-centerline, cached for reuse
@@ -67,8 +71,11 @@ impl CprFrame {
         let mut arclengths = Vec::with_capacity(n_cols);
         let mut tangents = Vec::with_capacity(n_cols);
 
+        // Matches Horos Straightened CPR convention: divisor = pixelsWide (not pixelsWide − 1),
+        // so samples run s_j = j * (total_arc / n_cols) for j = 0 .. n_cols−1.
+        let spacing = total_arc / (n_cols as f64);
         for j in 0..n_cols {
-            let s = total_arc * (j as f64) / ((n_cols - 1) as f64);
+            let s = (j as f64) * spacing;
             arclengths.push(s);
 
             let pos = spline.eval(s);
@@ -104,6 +111,7 @@ impl CprFrame {
         volume: &Array3<f32>,
         spacing: [f64; 3],
         origin: [f64; 3],
+        direction: &[f64; 9],
         rotation_deg: f64,
         width_mm: f64,
         pixels_high: usize,
@@ -114,8 +122,15 @@ impl CprFrame {
         // Rotate the Bishop frame by the given angle
         let (rot_normals, rot_binormals) = self.rotated_frame(rotation_deg);
 
-        // MIP slab sampling parameters
-        let n_slab_steps = if slab_mm > 0.01 { 9usize } else { 1 };
+        // MIP slab sampling parameters.
+        // Nyquist-aware (Horos-style), floored at 3 for stability on thin slabs.
+        let n_slab_steps = if slab_mm > 0.01 {
+            let min_spacing = spacing.iter().cloned().fold(f64::INFINITY, f64::min);
+            let horos = (slab_mm / min_spacing).ceil() as usize + 1;
+            horos.max(3)
+        } else {
+            1
+        };
         let slab_offsets: Vec<f64> = if n_slab_steps > 1 {
             (0..n_slab_steps)
                 .map(|k| {
@@ -129,45 +144,52 @@ impl CprFrame {
 
         let inv_spacing = [1.0 / spacing[0], 1.0 / spacing[1], 1.0 / spacing[2]];
 
-        // Image reconstruction
+        // Image reconstruction — parallelize over rows so each thread owns a
+        // contiguous row slice and never races with another.
         let mut image = vec![f32::NAN; pixels_high * n_cols];
 
-        for j in 0..n_cols {
-            let pos = Vector3::new(
-                self.positions[j][0],
-                self.positions[j][1],
-                self.positions[j][2],
-            );
-            let n_vec = rot_normals[j];
-            let b_vec = rot_binormals[j];
-
-            for i in 0..pixels_high {
+        image
+            .par_chunks_mut(n_cols)
+            .enumerate()
+            .for_each(|(i, row_slice)| {
                 // Lateral offset: top row = +width_mm, bottom row = -width_mm
                 let lateral =
                     width_mm * (1.0 - 2.0 * (i as f64) / ((pixels_high - 1) as f64));
 
-                let mut max_val = f32::NEG_INFINITY;
+                for j in 0..n_cols {
+                    let pos = Vector3::new(
+                        self.positions[j][0],
+                        self.positions[j][1],
+                        self.positions[j][2],
+                    );
+                    let n_vec = rot_normals[j];
+                    let b_vec = rot_binormals[j];
 
-                for &slab_off in &slab_offsets {
-                    let sample_mm = pos + lateral * n_vec + slab_off * b_vec;
+                    let mut max_val = f32::NEG_INFINITY;
 
-                    let vz = (sample_mm[0] - origin[0]) * inv_spacing[0];
-                    let vy = (sample_mm[1] - origin[1]) * inv_spacing[1];
-                    let vx = (sample_mm[2] - origin[2]) * inv_spacing[2];
+                    for &slab_off in &slab_offsets {
+                        let sample_mm = pos + lateral * n_vec + slab_off * b_vec;
 
-                    let val = trilinear(volume, vz, vy, vx);
-                    if !val.is_nan() && val > max_val {
-                        max_val = val;
+                        let [vz, vy, vx] = crate::types::patient_to_voxel(
+                            [sample_mm[0], sample_mm[1], sample_mm[2]],
+                            origin,
+                            inv_spacing,
+                            direction,
+                        );
+
+                        let val = trilinear(volume, vz, vy, vx);
+                        if !val.is_nan() && val > max_val {
+                            max_val = val;
+                        }
                     }
-                }
 
-                image[i * n_cols + j] = if max_val == f32::NEG_INFINITY {
-                    f32::NAN
-                } else {
-                    max_val
-                };
-            }
-        }
+                    row_slice[j] = if max_val == f32::NEG_INFINITY {
+                        f32::NAN
+                    } else {
+                        max_val
+                    };
+                }
+            });
 
         CprResult {
             image,
@@ -183,6 +205,7 @@ impl CprFrame {
         volume: &Array3<f32>,
         spacing: [f64; 3],
         origin: [f64; 3],
+        direction: &[f64; 9],
         position_frac: f64,
         rotation_deg: f64,
         width_mm: f64,
@@ -215,45 +238,47 @@ impl CprFrame {
 
                 let sample_mm = pos + offset_n * n_vec + offset_b * b_vec;
 
-                let vz = (sample_mm[0] - origin[0]) * inv_spacing[0];
-                let vy = (sample_mm[1] - origin[1]) * inv_spacing[1];
-                let vx = (sample_mm[2] - origin[2]) * inv_spacing[2];
+                let [vz, vy, vx] = crate::types::patient_to_voxel(
+                    [sample_mm[0], sample_mm[1], sample_mm[2]],
+                    origin,
+                    inv_spacing,
+                    direction,
+                );
 
                 image[row * pixels + col] = trilinear(volume, vz, vy, vx);
             }
         }
 
+        let geom = crate::vessel_wall::compute_vessel_geometry(
+            &image, pixels, width_mm, CROSS_SECTION_N_ANGLES,
+        );
+
         CrossSectionResult {
             image,
             pixels,
             arc_mm,
+            vessel_diameter_mm: geom.diameter_mm,
+            vessel_wall: geom.wall,
         }
     }
 
-    /// Render curved CPR: the vessel follows its natural projected path on screen.
-    ///
-    /// Instead of straightening the vessel into columns, each centerline position
-    /// is projected onto a 2D viewing plane, and perpendicular strips are painted
-    /// at the projected location.
-    ///
-    /// - `view_width_mm`, `view_height_mm`: physical size of the output viewport.
-    /// - `pixels_wide`, `pixels_high`: output image dimensions.
-    pub fn render_curved_cpr(
+    /// Render stretched CPR: each column is a projected arc-length position on the
+    /// mid-height plane; rows step along the projection normal.
+    pub fn render_stretched(
         &self,
         volume: &Array3<f32>,
         spacing: [f64; 3],
         origin: [f64; 3],
+        direction: &[f64; 9],
         rotation_deg: f64,
         width_mm: f64,
         pixels_wide: usize,
         pixels_high: usize,
         slab_mm: f64,
-    ) -> CurvedCprResult {
+    ) -> StretchedCprResult {
         let (rot_normals, rot_binormals) = self.rotated_frame(rotation_deg);
 
-        // Direct volume sampling with PCA viewing plane + 3D nearest-point lookup.
-        // No texture warping — each pixel samples the volume directly.
-        super::curved_cpr::render_curved_direct(
+        crate::stretched_cpr::render_stretched(
             &self.positions,
             &rot_normals,
             &rot_binormals,
@@ -261,6 +286,7 @@ impl CprFrame {
             volume,
             spacing,
             origin,
+            direction,
             width_mm,
             pixels_wide,
             pixels_high,
@@ -275,6 +301,7 @@ impl CprFrame {
         volume: &Array3<f32>,
         spacing: [f64; 3],
         origin: [f64; 3],
+        direction: &[f64; 9],
         position_fracs: &[f64],
         rotation_deg: f64,
         width_mm: f64,
@@ -285,7 +312,7 @@ impl CprFrame {
         let inv_spacing = [1.0 / spacing[0], 1.0 / spacing[1], 1.0 / spacing[2]];
 
         position_fracs
-            .iter()
+            .par_iter()
             .map(|&frac| {
                 let idx = ((frac * (n - 1) as f64).round() as usize).min(n - 1);
 
@@ -300,27 +327,39 @@ impl CprFrame {
 
                 let mut image = vec![f32::NAN; pixels * pixels];
 
-                for row in 0..pixels {
-                    for col in 0..pixels {
+                image
+                    .par_chunks_mut(pixels)
+                    .enumerate()
+                    .for_each(|(row, row_slice)| {
                         let offset_n = width_mm
                             * (1.0 - 2.0 * (row as f64) / ((pixels - 1) as f64));
-                        let offset_b = width_mm
-                            * (1.0 - 2.0 * (col as f64) / ((pixels - 1) as f64));
+                        for col in 0..pixels {
+                            let offset_b = width_mm
+                                * (1.0 - 2.0 * (col as f64) / ((pixels - 1) as f64));
 
-                        let sample_mm = pos + offset_n * n_vec + offset_b * b_vec;
+                            let sample_mm = pos + offset_n * n_vec + offset_b * b_vec;
 
-                        let vz = (sample_mm[0] - origin[0]) * inv_spacing[0];
-                        let vy = (sample_mm[1] - origin[1]) * inv_spacing[1];
-                        let vx = (sample_mm[2] - origin[2]) * inv_spacing[2];
+                            let [vz, vy, vx] = crate::types::patient_to_voxel(
+                                [sample_mm[0], sample_mm[1], sample_mm[2]],
+                                origin,
+                                inv_spacing,
+                                direction,
+                            );
 
-                        image[row * pixels + col] = trilinear(volume, vz, vy, vx);
-                    }
-                }
+                            row_slice[col] = trilinear(volume, vz, vy, vx);
+                        }
+                    });
+
+                let geom = crate::vessel_wall::compute_vessel_geometry(
+                    &image, pixels, width_mm, CROSS_SECTION_N_ANGLES,
+                );
 
                 CrossSectionResult {
                     image,
                     pixels,
                     arc_mm,
+                    vessel_diameter_mm: geom.diameter_mm,
+                    vessel_wall: geom.wall,
                 }
             })
             .collect()
@@ -330,7 +369,7 @@ impl CprFrame {
 
     /// Apply rotation around the tangent axis, returning rotated (normals, binormals).
     /// Does NOT mutate self — returns new vectors for the requested angle.
-    pub(crate) fn rotated_frame(
+    pub fn rotated_frame(
         &self,
         rotation_deg: f64,
     ) -> (Vec<Vector3<f64>>, Vec<Vector3<f64>>) {
@@ -368,7 +407,10 @@ fn bishop_frame(tangents: &[Vector3<f64>]) -> (Vec<Vector3<f64>>, Vec<Vector3<f6
     let mut normals = Vec::with_capacity(n);
     let mut binormals = Vec::with_capacity(n);
 
-    // Choose initial normal perpendicular to T[0]
+    // Choose initial normal perpendicular to T[0].
+    // Equivalent to Horos's N3VectorANormalVector(T₀) — the final image is
+    // rotation-invariant via the user's rotation slider, so the initial frame choice
+    // doesn't matter as long as it is orthogonal to T₀.
     let t0 = tangents[0];
     let world_y = Vector3::new(0.0, 1.0, 0.0);
     let world_x = Vector3::new(1.0, 0.0, 0.0);
@@ -382,6 +424,10 @@ fn bishop_frame(tangents: &[Vector3<f64>]) -> (Vec<Vector3<f64>>, Vec<Vector3<f6
     let b0 = t0.cross(&n0).normalize();
     normals.push(n0);
     binormals.push(b0);
+
+    // Bishop parallel transport — we deliberately deviate from Horos bend-lerp here.
+    // Bishop is rotation-minimizing; for low-torsion coronary centerlines the two are
+    // visually indistinguishable, and Bishop is more numerically principled.
 
     // Parallel transport: project previous normal onto the plane perp to current tangent
     for i in 1..n {
@@ -421,6 +467,7 @@ pub fn compute_cpr(
     centerline_mm: &[[f64; 3]],
     spacing: [f64; 3],
     origin: [f64; 3],
+    direction: &[f64; 9],
     width_mm: f64,
     slab_mm: f64,
     pixels_wide: usize,
@@ -428,7 +475,7 @@ pub fn compute_cpr(
     rotation_deg: f64,
 ) -> CprResult {
     let frame = CprFrame::from_centerline(centerline_mm, pixels_wide);
-    frame.render_cpr(volume, spacing, origin, rotation_deg, width_mm, pixels_high, slab_mm)
+    frame.render_cpr(volume, spacing, origin, direction, rotation_deg, width_mm, pixels_high, slab_mm)
 }
 
 /// Compute a cross-sectional image perpendicular to the centerline at a
@@ -438,6 +485,7 @@ pub fn compute_cross_section(
     centerline_mm: &[[f64; 3]],
     spacing: [f64; 3],
     origin: [f64; 3],
+    direction: &[f64; 9],
     position_frac: f64,
     rotation_deg: f64,
     width_mm: f64,
@@ -445,7 +493,7 @@ pub fn compute_cross_section(
 ) -> CrossSectionResult {
     let n_samples = centerline_mm.len().max(2);
     let frame = CprFrame::from_centerline(centerline_mm, n_samples);
-    frame.render_cross_section(volume, spacing, origin, position_frac, rotation_deg, width_mm, pixels)
+    frame.render_cross_section(volume, spacing, origin, direction, position_frac, rotation_deg, width_mm, pixels)
 }
 
 /// Compute multiple cross-sections in a single call. Legacy single-call API.
@@ -454,6 +502,7 @@ pub fn compute_cross_sections_batch(
     centerline_mm: &[[f64; 3]],
     spacing: [f64; 3],
     origin: [f64; 3],
+    direction: &[f64; 9],
     position_fracs: &[f64],
     rotation_deg: f64,
     width_mm: f64,
@@ -461,7 +510,7 @@ pub fn compute_cross_sections_batch(
 ) -> Vec<CrossSectionResult> {
     let n_samples = centerline_mm.len().max(2);
     let frame = CprFrame::from_centerline(centerline_mm, n_samples);
-    frame.render_cross_sections(volume, spacing, origin, position_fracs, rotation_deg, width_mm, pixels)
+    frame.render_cross_sections(volume, spacing, origin, direction, position_fracs, rotation_deg, width_mm, pixels)
 }
 
 #[cfg(test)]
@@ -498,6 +547,7 @@ mod tests {
             &centerline,
             spacing,
             origin,
+            &crate::types::IDENTITY_DIRECTION,
             10.0,  // width_mm
             0.0,   // no slab
             60,    // pixels_wide
@@ -540,6 +590,7 @@ mod tests {
             &centerline,
             spacing,
             origin,
+            &crate::types::IDENTITY_DIRECTION,
             0.5,   // middle of the centerline
             0.0,   // no rotation
             10.0,  // width_mm
@@ -585,8 +636,9 @@ mod tests {
         assert_eq!(frame.arclengths.len(), 60);
 
         // Render at two different rotations — both should produce valid images
-        let r1 = frame.render_cpr(&vol, spacing, origin, 0.0, 10.0, 21, 0.0);
-        let r2 = frame.render_cpr(&vol, spacing, origin, 90.0, 10.0, 21, 0.0);
+        let id = &crate::types::IDENTITY_DIRECTION;
+        let r1 = frame.render_cpr(&vol, spacing, origin, id, 0.0, 10.0, 21, 0.0);
+        let r2 = frame.render_cpr(&vol, spacing, origin, id, 90.0, 10.0, 21, 0.0);
 
         assert_eq!(r1.image.len(), 60 * 21);
         assert_eq!(r2.image.len(), 60 * 21);
@@ -612,7 +664,7 @@ mod tests {
 
         // Batch cross-sections
         let results = frame.render_cross_sections(
-            &vol, spacing, origin,
+            &vol, spacing, origin, &crate::types::IDENTITY_DIRECTION,
             &[0.25, 0.5, 0.75],
             0.0, 10.0, 21,
         );
@@ -815,15 +867,17 @@ mod tests {
 
     #[test]
     fn test_from_centerline_endpoints() {
+        // Under the Horos Straightened convention, s_j = j * (total_arc / n_cols),
+        // so the first sample is at s=0 (exact centerline start) but the LAST sample
+        // is at s = (n_cols − 1) / n_cols * total_arc, NOT at total_arc. The last
+        // position therefore lies ~1/n_cols short of the input's final point.
+        let n_cols = 50;
         let pts = quarter_circle(20.0, 25);
-        let frame = CprFrame::from_centerline(&pts, 50);
+        let frame = CprFrame::from_centerline(&pts, n_cols);
         let tol = 1e-3;
 
         let first = &frame.positions[0];
-        let last = &frame.positions[frame.n_cols() - 1];
-
         let first_in = &pts[0];
-        let last_in = &pts[pts.len() - 1];
 
         for d in 0..3 {
             assert!(
@@ -831,10 +885,23 @@ mod tests {
                 "First position mismatch in dim {}: got {}, expected {}",
                 d, first[d], first_in[d]
             );
+        }
+
+        // Last sample should land at s = (n_cols − 1) / n_cols * total_arc.
+        // For a quarter-circle of radius r, total_arc = r · π / 2, so the last
+        // angle θ = (n_cols − 1) / n_cols · π / 2 and the expected position is
+        // [r·sin(θ), r·cos(θ), 0].
+        let r = 20.0_f64;
+        let theta_last = (n_cols - 1) as f64 / n_cols as f64 * std::f64::consts::FRAC_PI_2;
+        let expected_last = [r * theta_last.sin(), r * theta_last.cos(), 0.0];
+        let last = &frame.positions[frame.n_cols() - 1];
+        // Spline fit introduces slight deviation from analytic curve, so a looser tolerance.
+        let end_tol = 5e-2;
+        for d in 0..3 {
             assert!(
-                (last[d] - last_in[d]).abs() < tol,
-                "Last position mismatch in dim {}: got {}, expected {}",
-                d, last[d], last_in[d]
+                (last[d] - expected_last[d]).abs() < end_tol,
+                "Last position mismatch in dim {}: got {}, expected ~{} (Horos: s_last = (n−1)/n · total_arc)",
+                d, last[d], expected_last[d]
             );
         }
     }
@@ -865,364 +932,249 @@ mod tests {
         }
     }
 
-    /// Test every 1° rotation angle on real patient data.
-    /// Verifies the centerline pixels show high HU (inside vessel) at all angles.
-    #[test]
-    #[ignore] // cargo test --lib -- --ignored --nocapture test_curved_cpr_centerline_hu_real_patient
-    fn test_curved_cpr_centerline_hu_real_patient() {
-        use std::path::Path;
-        use super::super::curved_cpr;
+    // -----------------------------------------------------------------------
+    // Stretched CPR patient regression tests (ignored — require local DICOM data)
+    // -----------------------------------------------------------------------
 
-        // Patient 317.6 — the one the user reported the issue on
-        let dicom_dir = Path::new("/Users/shunie/Developer/PCAT/Rahaf_Patients/317.6");
+    /// Check that the vessel centerline pixel (found by projecting each orig_col_pt
+    /// onto the stretched image) consistently lands in lumen tissue (HU > 150) across
+    /// all 360 rotation angles.  A 5x5 neighbourhood is sampled to tolerate sub-pixel
+    /// placement error.
+    ///
+    /// If more than 15% of the visible (non-clipped) middle-80% centerline columns
+    /// have a neighbourhood max below 150 HU the rotation angle is flagged as failed.
+    /// Columns whose projected row falls outside [2, pixels_high − 3] are clipped:
+    /// they are excluded from the HU check entirely (not counted toward n_checked or
+    /// n_low).  Clipping is expected at oblique angles when the viewport Y-range is too
+    /// small to contain the vessel's out-of-plane depth excursion; the clinician would
+    /// simply pick a better rotation.  n_clipped is reported at the end but does NOT
+    /// cause the test to fail.  Only algorithmic regressions (vessel not in lumen among
+    /// visible columns) cause failure.
+    fn run_stretched_centerline_test(
+        dicom_dir: &std::path::Path,
+        seeds_xyz: &[[f64; 3]],
+        px_w: usize,
+        px_h: usize,
+        test_name: &str,
+    ) {
         if !dicom_dir.exists() {
-            eprintln!("DICOM dir not found, skipping");
+            eprintln!("[{test_name}] DICOM directory not found – skipping: {}", dicom_dir.display());
             return;
         }
 
-        // Seeds from saved file (cornerstone [x, y, z] ordering → convert to [z, y, x])
-        let seeds_xyz: Vec<[f64; 3]> = vec![
+        eprintln!("[{test_name}] Loading DICOM from {} …", dicom_dir.display());
+        let vol = crate::dicom_loader::load_dicom_directory(dicom_dir)
+            .expect("failed to load DICOM directory");
+        eprintln!(
+            "[{test_name}] Loaded: shape={:?}, spacing={:?}",
+            vol.data.shape(),
+            vol.spacing
+        );
+
+        // Convert seeds from Cornerstone [x, y, z] → pipeline [z, y, x]
+        let seeds_zyx: Vec<[f64; 3]> = seeds_xyz
+            .iter()
+            .map(|s| [s[2], s[1], s[0]])
+            .collect();
+
+        let frame = CprFrame::from_centerline(&seeds_zyx, px_w);
+        let n = frame.positions.len(); // == px_w
+
+        let mut failed_angles: Vec<(i32, f64, usize)> = Vec::new(); // (rot, worst_hu, n_low)
+        // Track angles where clipping is heavy, for informational reporting only.
+        let mut worst_clipped_angles: Vec<(i32, usize)> = Vec::new(); // (rot, n_clipped)
+
+        for rot_deg in 0i32..360 {
+            let result = frame.render_stretched(
+                &vol.data,
+                vol.spacing,
+                vol.origin,
+                &vol.direction,
+                rot_deg as f64,
+                25.0,
+                px_w,
+                px_h,
+                1.0,
+            );
+            let geom = crate::stretched_cpr::compute_stretched_geometry(
+                &frame.positions,
+                px_w,
+                rot_deg as f64,
+            );
+
+            let col_start = n / 10;
+            let col_end = n - n / 10;
+
+            let mut n_checked: usize = 0; // visible columns included in HU check
+            let mut n_low: usize = 0;     // visible columns with best_hu < 150
+            let mut n_clipped: usize = 0; // columns whose row is outside [2, px_h-3]
+            let mut worst_hu = f32::INFINITY;
+
+            for j in col_start..col_end {
+                let orig_pt = geom.orig_col_pts[j];
+                let mid_pt = geom.mid_height_point;
+                let depth_mm = (orig_pt - mid_pt).dot(&geom.projection_normal);
+                let row_f = px_h as f64 / 2.0 - depth_mm / geom.dy_mm;
+                let row = row_f.round() as isize;
+                let col = j as isize;
+
+                // Clipped: vessel has scrolled outside the viewport at this rotation.
+                // This is expected behaviour, not an algorithmic regression – skip it.
+                if row < 2 || row >= px_h as isize - 3 {
+                    n_clipped += 1;
+                    continue;
+                }
+
+                n_checked += 1;
+
+                // 5x5 neighbourhood max
+                let mut best_hu = f32::NEG_INFINITY;
+                for dr in -2isize..=2 {
+                    for dc in -2isize..=2 {
+                        let r = row + dr;
+                        let c = col + dc;
+                        if r >= 0 && r < px_h as isize && c >= 0 && c < px_w as isize {
+                            let idx = r as usize * px_w + c as usize;
+                            let v = result.image[idx];
+                            if !v.is_nan() && v > best_hu {
+                                best_hu = v;
+                            }
+                        }
+                    }
+                }
+
+                if best_hu < worst_hu {
+                    worst_hu = best_hu;
+                }
+                if best_hu < 150.0 {
+                    n_low += 1;
+                }
+            }
+
+            let n_visible = n_checked;
+            let failed = n_visible > 0 && n_low as f64 / n_visible as f64 > 0.15;
+
+            if failed {
+                eprintln!(
+                    "[{test_name}] rot={rot_deg:3}°  FAIL     worst_hu={worst_hu:.1}  n_low={n_low}/{n_visible}  n_clipped={n_clipped}",
+                );
+                failed_angles.push((rot_deg, worst_hu as f64, n_low));
+            } else {
+                eprintln!(
+                    "[{test_name}] rot={rot_deg:3}°  ok       worst_hu={worst_hu:.1}  n_low={n_low}/{n_visible}  n_clipped={n_clipped}",
+                );
+            }
+
+            if n_clipped > 0 {
+                worst_clipped_angles.push((rot_deg, n_clipped));
+            }
+        }
+
+        // Report clipping summary (informational – does NOT fail the test).
+        if !worst_clipped_angles.is_empty() {
+            worst_clipped_angles.sort_by_key(|&(_, nc)| std::cmp::Reverse(nc));
+            let total_clipped_angles = worst_clipped_angles.len();
+            eprintln!(
+                "[{test_name}] Clipping summary: {total_clipped_angles} angles had ≥1 clipped column. \
+                 Top 10 by n_clipped: {:?}",
+                &worst_clipped_angles[..worst_clipped_angles.len().min(10)],
+            );
+        } else {
+            eprintln!("[{test_name}] No clipping observed across all 360 rotations.");
+        }
+
+        if !failed_angles.is_empty() {
+            panic!(
+                "[{test_name}] ALGORITHMIC REGRESSION: {} angles had visible columns with HU < 150 \
+                 (vessel not in lumen).\nFailed (up to 10): {:?}",
+                failed_angles.len(),
+                &failed_angles[..failed_angles.len().min(10)],
+            );
+        }
+
+        eprintln!("[{test_name}] All 360 rotations passed (clipping is informational only).");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_stretched_cpr_centerline_hu_317() {
+        // Patient 317.6 – RCA, 16 seeds.  Image size: 512 wide × 256 high.
+        let dicom_dir = std::path::Path::new(
+            "/Users/shunie/Developer/PCAT/Rahaf_Patients/317.6",
+        );
+
+        // Seeds in Cornerstone [x, y, z] order.
+        let seeds_xyz: &[[f64; 3]] = &[
             [18.513, -174.185, 1922.507],
             [18.071, -181.259, 1922.507],
             [14.976, -187.007, 1922.507],
             [12.765, -190.987, 1922.507],
-            [2.596, -194.966, 1915.733],
+            [2.596,  -194.966, 1915.733],
             [-2.268, -198.061, 1910.314],
             [-5.500, -198.061, 1904.611],
             [-8.599, -198.061, 1896.691],
-            [-10.321, -198.061, 1890.838],
-            [-10.665, -193.840, 1879.820],
+            [-10.321,-198.061, 1890.838],
+            [-10.665,-193.840, 1879.820],
             [-8.255, -190.791, 1875.0],
             [-0.576, -182.322, 1868.712],
-            [6.695, -174.192, 1868.051],
+            [6.695,  -174.192, 1868.051],
             [10.881, -169.450, 1868.932],
             [17.051, -162.336, 1872.017],
             [22.119, -155.561, 1875.762],
         ];
-        // Convert to [z, y, x]
-        let seeds_zyx: Vec<[f64; 3]> = seeds_xyz.iter()
-            .map(|s| [s[2], s[1], s[0]])
-            .collect();
 
-        eprintln!("Loading volume...");
-        let vol = crate::pipeline::dicom_loader::load_dicom_directory(dicom_dir).unwrap();
-        eprintln!("Volume: {:?}, spacing: {:?}, origin: {:?}", vol.data.shape(), vol.spacing, vol.origin);
-
-        // Build spline + frame
-        let spline = crate::pipeline::spline::CubicSpline3D::fit(&seeds_zyx);
-        let n_cols = 512;
-        let cl: Vec<[f64; 3]> = (0..n_cols)
-            .map(|i| spline.eval(spline.total_arc() * i as f64 / (n_cols - 1) as f64))
-            .collect();
-        let frame = CprFrame::from_centerline(&cl, n_cols);
-
-        let width_mm = 25.0;
-        let px_w = 512;
-        let px_h = 256;
-        let hu_threshold = 150.0; // iodinated blood should be >200 HU
-
-        let mut failed_angles: Vec<(i32, f64, usize, usize)> = Vec::new();
-        let mut all_worst: Vec<(i32, f64)> = Vec::new();
-
-        for rot_deg in 0..360 {
-            let result = frame.render_curved_cpr(
-                &vol.data, vol.spacing, vol.origin,
-                rot_deg as f64, width_mm, px_w, px_h, 1.0,
-            );
-
-            // Project centerline to pixel coordinates (PCA-based, matches renderer)
-            let (_vf, vr, vu) = curved_cpr::compute_view_basis_pca_with_rotation(
-                &frame.positions, rot_deg as f64,
-            );
-            let mid_idx = frame.n_cols() / 2;
-            let center = frame.positions[mid_idx];
-            let projected = curved_cpr::project_centerline_2d(
-                &frame.positions, center, &vr, &vu,
-            );
-
-            // Bbox (same as renderer)
-            let mut bmin_x = f64::MAX;
-            let mut bmax_x = f64::NEG_INFINITY;
-            let mut bmin_y = f64::MAX;
-            let mut bmax_y = f64::NEG_INFINITY;
-            for &(px, py) in &projected {
-                if px < bmin_x { bmin_x = px; }
-                if px > bmax_x { bmax_x = px; }
-                if py < bmin_y { bmin_y = py; }
-                if py > bmax_y { bmax_y = py; }
-            }
-            let pad = curved_cpr::CONTEXT_PAD_MM;
-            bmin_x -= pad; bmax_x += pad;
-            bmin_y -= pad; bmax_y += pad;
-            // Isotropic correction (same as renderer)
-            let mut vw = bmax_x - bmin_x;
-            let mut vh = bmax_y - bmin_y;
-            let target_ratio = px_w as f64 / px_h as f64;
-            let bbox_ratio = vw / vh;
-            if bbox_ratio < target_ratio {
-                let new_w = vh * target_ratio;
-                let extra = (new_w - vw) / 2.0;
-                bmin_x -= extra; bmax_x += extra;
-                vw = bmax_x - bmin_x;
-            } else {
-                let new_h = vw / target_ratio;
-                let extra = (new_h - vh) / 2.0;
-                bmin_y -= extra; bmax_y += extra;
-                vh = bmax_y - bmin_y;
-            }
-
-            // Check middle 80% of centerline
-            let n = frame.n_cols();
-            let start = n / 10;
-            let end = n - n / 10;
-            let mut worst_hu = f64::MAX;
-            let mut n_checked = 0usize;
-            let mut n_low = 0usize;
-
-            for j in start..end {
-                let (px, py) = projected[j];
-                let col = ((px - bmin_x) / vw * (px_w - 1) as f64).round() as isize;
-                let row = ((bmax_y - py) / vh * (px_h - 1) as f64).round() as isize;
-                if col < 1 || col >= (px_w - 1) as isize || row < 1 || row >= (px_h - 1) as isize {
-                    continue;
-                }
-
-                // Max value in 5x5 neighbourhood (vessel is a few pixels wide)
-                let mut best_val = f32::NEG_INFINITY;
-                for dr in -2..=2isize {
-                    for dc in -2..=2isize {
-                        let r = (row + dr).max(0).min(px_h as isize - 1) as usize;
-                        let c = (col + dc).max(0).min(px_w as isize - 1) as usize;
-                        let val = result.image[r * px_w + c];
-                        if !val.is_nan() && val > best_val {
-                            best_val = val;
-                        }
-                    }
-                }
-                n_checked += 1;
-                let hu = best_val as f64;
-                if hu < worst_hu { worst_hu = hu; }
-                if hu < hu_threshold { n_low += 1; }
-            }
-
-            all_worst.push((rot_deg, worst_hu));
-
-            // More than 15% of centerline points below threshold → failure
-            if n_checked > 0 && (n_low as f64 / n_checked as f64) > 0.15 {
-                failed_angles.push((rot_deg, worst_hu, n_checked, n_low));
-            }
-        }
-
-        // Print summary
-        eprintln!("\n=== Worst HU at centerline per angle (first 36) ===");
-        for chunk in all_worst.chunks(36) {
-            let line: Vec<String> = chunk.iter()
-                .map(|(a, hu)| format!("{}°:{:.0}", a, hu))
-                .collect();
-            eprintln!("  {}", line.join("  "));
-        }
-
-        if !failed_angles.is_empty() {
-            eprintln!("\n=== FAILED ANGLES ({}) ===", failed_angles.len());
-            for (a, hu, nc, nl) in &failed_angles {
-                eprintln!("  {}° — worst HU={:.0}, {}/{} low (<{:.0})", a, hu, nl, nc, hu_threshold);
-            }
-            panic!(
-                "Vessel centerline below {} HU at {} out of 360 angles",
-                hu_threshold, failed_angles.len()
-            );
-        }
-        eprintln!("\nAll 360 angles passed: centerline always inside vessel (>{} HU)", hu_threshold);
+        run_stretched_centerline_test(dicom_dir, seeds_xyz, 512, 512, "317.6");
     }
 
-    /// Test patient 161.6 — the patient where seeds at 90°/270° failed.
     #[test]
     #[ignore]
-    fn test_curved_cpr_patient_161() {
-        use std::path::Path;
-        use super::super::curved_cpr;
+    fn test_stretched_cpr_centerline_hu_161() {
+        // Patient 161.6 – RCA, 23 seeds.  Image size: 512 × 512 (square).
+        let dicom_dir = std::path::Path::new(
+            "/Users/shunie/Developer/PCAT/Rahaf_Patients/161.6/CCTA l-70 (KVP)",
+        );
 
-        let dicom_dir = Path::new("/Users/shunie/Developer/PCAT/Rahaf_Patients/161.6/CCTA l-70 (KVP)");
-        if !dicom_dir.exists() { eprintln!("DICOM dir not found"); return; }
-
-        // Seeds from saved file (cornerstone [x, y, z] → [z, y, x])
-        let seeds_xyz: Vec<[f64; 3]> = vec![
-            [-10.87,-224.30,1744.50], [-3.39,-231.24,1744.50],
-            [0.87,-238.71,1744.50],   [4.08,-245.12,1744.50],
-            [2.22,-249.07,1740.90],   [-2.33,-250.50,1740.90],
-            [-9.03,-251.46,1740.90],  [-13.58,-251.70,1740.90],
-            [-16.78,-251.70,1738.14], [-19.09,-251.70,1732.53],
-            [-20.08,-252.98,1727.25], [-22.72,-255.00,1720.66],
-            [-27.01,-257.84,1715.05], [-30.64,-257.84,1711.09],
-            [-32.95,-257.84,1706.47], [-34.27,-252.57,1696.24],
-            [-34.27,-250.37,1690.64], [-34.27,-249.38,1685.36],
-            [-27.43,-249.71,1676.78], [-17.70,-237.50,1680.08],
-            [-10.41,-226.62,1682.39], [-6.76,-222.33,1683.71],
-            [0.13,-217.71,1685.03],
+        // Seeds in Cornerstone [x, y, z] order.
+        let seeds_xyz: &[[f64; 3]] = &[
+            [-10.87, -224.30, 1744.50],
+            [-3.39,  -231.24, 1744.50],
+            [0.87,   -238.71, 1744.50],
+            [4.08,   -245.12, 1744.50],
+            [2.22,   -249.07, 1740.90],
+            [-2.33,  -250.50, 1740.90],
+            [-9.03,  -251.46, 1740.90],
+            [-13.58, -251.70, 1740.90],
+            [-16.78, -251.70, 1738.14],
+            [-19.09, -251.70, 1732.53],
+            [-20.08, -252.98, 1727.25],
+            [-22.72, -255.00, 1720.66],
+            [-27.01, -257.84, 1715.05],
+            [-30.64, -257.84, 1711.09],
+            [-32.95, -257.84, 1706.47],
+            [-34.27, -252.57, 1696.24],
+            [-34.27, -250.37, 1690.64],
+            [-34.27, -249.38, 1685.36],
+            [-27.43, -249.71, 1676.78],
+            [-17.70, -237.50, 1680.08],
+            [-10.41, -226.62, 1682.39],
+            [-6.76,  -222.33, 1683.71],
+            [0.13,   -217.71, 1685.03],
         ];
-        let seeds_zyx: Vec<[f64; 3]> = seeds_xyz.iter().map(|s| [s[2], s[1], s[0]]).collect();
 
-        eprintln!("Loading 161.6 volume...");
-        let vol = crate::pipeline::dicom_loader::load_dicom_directory(dicom_dir).unwrap();
-        eprintln!("Volume: {:?}, spacing: {:?}", vol.data.shape(), vol.spacing);
-
-        let spline = crate::pipeline::spline::CubicSpline3D::fit(&seeds_zyx);
-        let n_cols = 512;
-        let cl: Vec<[f64; 3]> = (0..n_cols)
-            .map(|i| spline.eval(spline.total_arc() * i as f64 / (n_cols - 1) as f64))
-            .collect();
-        let frame = CprFrame::from_centerline(&cl, n_cols);
-
-        let px_w = 512usize;
-        let px_h = 512usize;
-        let width_mm = 25.0;
-        let hu_threshold = 150.0;
-
-        let mut failed_angles: Vec<(i32, f64, usize, usize)> = Vec::new();
-        let mut all_worst: Vec<(i32, f64)> = Vec::new();
-
-        for rot_deg in 0..360 {
-            let result = frame.render_curved_cpr(
-                &vol.data, vol.spacing, vol.origin,
-                rot_deg as f64, width_mm, px_w, px_h, 1.0,
-            );
-            let (_vf, vr, vu) = curved_cpr::compute_view_basis_pca_with_rotation(
-                &frame.positions, rot_deg as f64,
-            );
-            let mid_idx = frame.n_cols() / 2;
-            let center = frame.positions[mid_idx];
-            let projected = curved_cpr::project_centerline_2d(&frame.positions, center, &vr, &vu);
-
-            let mut bmin_x = f64::MAX; let mut bmax_x = f64::NEG_INFINITY;
-            let mut bmin_y = f64::MAX; let mut bmax_y = f64::NEG_INFINITY;
-            for &(px, py) in &projected {
-                if px < bmin_x { bmin_x = px; }
-                if px > bmax_x { bmax_x = px; }
-                if py < bmin_y { bmin_y = py; }
-                if py > bmax_y { bmax_y = py; }
-            }
-            let pad = curved_cpr::CONTEXT_PAD_MM;
-            bmin_x -= pad; bmax_x += pad; bmin_y -= pad; bmax_y += pad;
-            let mut vw = bmax_x - bmin_x;
-            let mut vh = bmax_y - bmin_y;
-            let target_ratio = px_w as f64 / px_h as f64;
-            let bbox_ratio = vw / vh;
-            if bbox_ratio < target_ratio {
-                let extra = (vh * target_ratio - vw) / 2.0;
-                bmin_x -= extra; bmax_x += extra; vw = bmax_x - bmin_x;
-            } else {
-                let extra = (vw / target_ratio - vh) / 2.0;
-                bmin_y -= extra; bmax_y += extra; vh = bmax_y - bmin_y;
-            }
-
-            let n = frame.n_cols();
-            let start = n / 10; let end = n - n / 10;
-            let mut worst_hu = f64::MAX;
-            let mut n_checked = 0usize; let mut n_low = 0usize;
-
-            for j in start..end {
-                let (px, py) = projected[j];
-                let col = ((px - bmin_x) / vw * (px_w - 1) as f64).round() as isize;
-                let row = ((bmax_y - py) / vh * (px_h - 1) as f64).round() as isize;
-                if col < 2 || col >= (px_w - 2) as isize || row < 2 || row >= (px_h - 2) as isize { continue; }
-                let mut best_val = f32::NEG_INFINITY;
-                for dr in -2..=2isize {
-                    for dc in -2..=2isize {
-                        let r = (row + dr) as usize;
-                        let c = (col + dc) as usize;
-                        let val = result.image[r * px_w + c];
-                        if !val.is_nan() && val > best_val { best_val = val; }
-                    }
-                }
-                n_checked += 1;
-                let hu = best_val as f64;
-                if hu < worst_hu { worst_hu = hu; }
-                if hu < hu_threshold { n_low += 1; }
-            }
-            all_worst.push((rot_deg, worst_hu));
-            if n_checked > 0 && (n_low as f64 / n_checked as f64) > 0.15 {
-                failed_angles.push((rot_deg, worst_hu, n_checked, n_low));
-            }
-        }
-
-        // Print key angles
-        for &deg in &[0, 45, 90, 135, 180, 225, 270, 315] {
-            let (_, hu) = all_worst[deg];
-            eprintln!("  {}°: worst HU = {:.0}", deg, hu);
-        }
-
-        if !failed_angles.is_empty() {
-            eprintln!("\n=== FAILED ({}) ===", failed_angles.len());
-            for (a, hu, nc, nl) in &failed_angles {
-                eprintln!("  {}° — worst={:.0}, {}/{} low", a, hu, nl, nc);
-            }
-            panic!("Failed at {} angles", failed_angles.len());
-        }
-        eprintln!("\nAll 360 angles passed (>{} HU)", hu_threshold);
+        run_stretched_centerline_test(dicom_dir, seeds_xyz, 512, 512, "161.6");
     }
 
     #[test]
-    #[ignore] // cargo test --lib -- --ignored --nocapture test_rca_reference
-    fn test_rca_reference() {
-        use std::path::Path;
-
-        let dicom_dir = Path::new("/Users/shunie/Developer/PCAT/Rahaf_Patients/1200.2");
-        if !dicom_dir.exists() {
-            eprintln!("DICOM dir not found, skipping");
-            return;
+    fn test_horos_straightened_spacing_convention() {
+        // Synthetic straight centerline from (0,0,0) to (0,0,100), 2 points.
+        let points = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 100.0]];
+        let frame = CprFrame::from_centerline(&points, 10);
+        // With 10 cols and total_arc=100, spacing = 100/10 = 10.
+        // Horos convention: s_j = j * 10, so arclengths = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90].
+        let expected = [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0];
+        for (i, &s) in frame.arclengths.iter().enumerate() {
+            assert!((s - expected[i]).abs() < 1e-9, "col {i}: got {s}, expected {}", expected[i]);
         }
-
-        // Saved RCA seeds [x,y,z] → [z,y,x]
-        let seeds_zyx: Vec<[f64; 3]> = vec![
-            [1844.686, -177.084, 44.949], [1844.686, -183.413, 43.262],
-            [1844.686, -188.476, 40.730], [1844.686, -191.852, 36.089],
-            [1843.425, -192.696, 31.248], [1842.424, -193.118, 23.574],
-            [1842.424, -192.696, 17.235], [1840.923, -194.942, 12.564],
-            [1836.752, -194.942, 9.895],  [1830.079, -195.609, 10.228],
-            [1824.741, -194.942, 12.230], [1819.403, -194.942, 14.232],
-            [1814.898, -192.940, 15.900], [1811.729, -192.021, 18.569],
-            [1807.725, -188.780, 20.238], [1805.390, -180.677, 24.241],
-            [1806.724, -168.362, 28.579], [1806.391, -157.342, 37.587],
-            [1806.724, -150.861, 45.928], [1808.057, -148.813, 48.747],
-            [1811.395, -145.027, 49.932], [1818.068, -139.517, 54.603],
-            [1821.404, -139.517, 58.940], [1822.406, -134.332, 65.947],
-        ];
-
-        let vol = crate::pipeline::dicom_loader::load_dicom_directory(dicom_dir).unwrap();
-        eprintln!("Volume: {:?}, spacing: {:?}", vol.data.shape(), vol.spacing);
-
-        let spline = crate::pipeline::spline::CubicSpline3D::fit(&seeds_zyx);
-        let n = 768;
-        let cl: Vec<[f64; 3]> = (0..n)
-            .map(|i| spline.eval(spline.total_arc() * i as f64 / (n - 1) as f64))
-            .collect();
-
-        let frame = CprFrame::from_centerline(&cl, n);
-        let out_dir = Path::new("/Users/shunie/Developer/PCAT/pcat-workstation-v2/test_output");
-        std::fs::create_dir_all(out_dir).unwrap();
-
-        // Test with width=25 (50mm total, matching syngo.via FOV)
-        for rot in [0.0, 90.0, 180.0, 270.0] {
-            let result = frame.render_curved_cpr(
-                &vol.data, vol.spacing, vol.origin, rot, 25.0, 768, 384, 1.0,
-            );
-            let valid: Vec<f32> = result.image.iter().copied().filter(|v| !v.is_nan()).collect();
-            let nan_pct = 100.0 * (result.image.len() - valid.len()) as f64 / result.image.len() as f64;
-            eprintln!("Rot {:.0}°: {:.1}% NaN, range [{:.0}, {:.0}]",
-                rot, nan_pct,
-                valid.iter().copied().fold(f32::INFINITY, f32::min),
-                valid.iter().copied().fold(f32::NEG_INFINITY, f32::max),
-            );
-            let bytes: &[u8] = bytemuck::cast_slice(&result.image);
-            std::fs::write(out_dir.join(format!("rca_curved_rot{:.0}.raw", rot)), bytes).unwrap();
-        }
-
-        // Also straightened
-        let straight = frame.render_cpr(&vol.data, vol.spacing, vol.origin, 0.0, 40.0, 384, 1.0);
-        let bytes: &[u8] = bytemuck::cast_slice(&straight.image);
-        std::fs::write(out_dir.join("rca_straightened.raw"), bytes).unwrap();
-        eprintln!("Straightened: {}x{}", straight.pixels_wide, straight.pixels_high);
-
-        eprintln!("Output saved to {:?}", out_dir);
     }
+
 }

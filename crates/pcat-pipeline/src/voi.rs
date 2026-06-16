@@ -1,7 +1,7 @@
 use nalgebra::Vector3;
 use ndarray::Array3;
 
-use super::contour::ContourResult;
+use crate::contour::ContourResult;
 
 /// VOI construction mode.
 pub enum VoiMode {

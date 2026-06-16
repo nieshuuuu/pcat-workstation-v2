@@ -308,23 +308,34 @@ export const seedStore = {
     return JSON.stringify({ activeVessel, vessels: data }, null, 2);
   },
 
-  /** Import seed data from a JSON string (exported by exportJson). */
+  /**
+   * Import seed data from a JSON string (exported by exportJson).
+   *
+   * Full replacement: vessels absent from the JSON are reset to empty, so
+   * importing can never leak state from a previously-loaded patient.
+   */
   importJson(json: string) {
     const parsed = JSON.parse(json);
-    if (parsed.activeVessel) {
-      activeVessel = parsed.activeVessel;
-    }
+    const next: Record<Vessel, VesselData> = {
+      LAD: emptyVesselData(),
+      LCx: emptyVesselData(),
+      RCA: emptyVesselData(),
+    };
     if (parsed.vessels) {
       for (const v of ALL_VESSELS) {
         const vd = parsed.vessels[v];
         if (!vd) continue;
         const seeds = (vd.seeds ?? []).map((pos: [number, number, number]) => ({ position: pos }));
-        vesselData[v] = recomputeCenterline({
+        next[v] = recomputeCenterline({
           seeds,
           centerline: null,
           ostiumFraction: vd.ostiumFraction ?? null,
         });
       }
+    }
+    vesselData = next;
+    if (parsed.activeVessel) {
+      activeVessel = parsed.activeVessel;
     }
     selectedSeedIndex = null;
   },
