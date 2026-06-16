@@ -11,6 +11,7 @@
   import { onMount, tick } from 'svelte';
   import { pipelineStore, type FaiStats } from '$lib/stores/pipelineStore.svelte';
   import { VESSEL_COLORS, type Vessel } from '$lib/stores/seedStore.svelte';
+  import { volumeStore } from '$lib/stores/volumeStore.svelte';
 
   const TABS = ['Overview', 'Histograms', 'Radial Profile', 'Angular'] as const;
   type Tab = (typeof TABS)[number];
@@ -36,6 +37,69 @@
     Plotly = mod.default ?? mod;
     plotlyLoaded = true;
   });
+
+  /* ── FAI export ────────────────────────────────────────── */
+
+  function downloadBlob(name: string, text: string, type: string) {
+    const blob = new Blob([text], { type });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const num = (v: number | null | undefined, d: number) =>
+    v == null || !isFinite(v) ? '' : v.toFixed(d);
+
+  /** Export every FAI result to files: a CSV with summary + radial + angular
+   *  blocks, and a complete JSON (incl. histograms) for machine use. */
+  function exportFai() {
+    const results = pipelineStore.results;
+    if (!results || vesselResults.length === 0) return;
+    const patient = volumeStore.current?.patientName ?? 'patient';
+
+    const summary = ['vessel,n_voi_voxels,n_fat_voxels,fat_fraction,hu_mean,hu_std,hu_median,fai_risk'];
+    const radial = ['vessel,distance_mm,mean_hu,std_hu'];
+    const angular = ['vessel,sector_label,angle_deg,hu_mean,hu_std,n_voxels,fai_risk'];
+
+    for (const { vessel, stats } of vesselResults) {
+      summary.push(
+        [
+          vessel,
+          stats.n_voi_voxels,
+          stats.n_fat_voxels,
+          num(stats.fat_fraction, 4),
+          num(stats.hu_mean, 2),
+          num(stats.hu_std, 2),
+          num(stats.hu_median, 2),
+          stats.fai_risk,
+        ].join(','),
+      );
+      const rp = stats.radial_profile;
+      if (rp) {
+        rp.distances_mm.forEach((d, i) => {
+          radial.push(`${vessel},${num(d, 2)},${num(rp.mean_hu[i], 2)},${num(rp.std_hu[i], 2)}`);
+        });
+      }
+      const aa = stats.angular_asymmetry;
+      if (aa) {
+        for (const s of aa.sectors) {
+          angular.push(
+            `${vessel},${s.label},${num(s.angle_deg, 1)},${num(s.hu_mean, 2)},${num(s.hu_std, 2)},${s.n_voxels},${s.fai_risk}`,
+          );
+        }
+      }
+    }
+
+    const csv =
+      `# FAI summary\n${summary.join('\n')}\n\n` +
+      `# Radial profile (mean HU vs distance from wall)\n${radial.join('\n')}\n\n` +
+      `# Angular sectors\n${angular.join('\n')}\n`;
+    downloadBlob(`${patient}_fai.csv`, csv, 'text/csv');
+    downloadBlob(`${patient}_fai.json`, JSON.stringify(results, null, 2), 'application/json');
+  }
 
   // Histogram effect
   $effect(() => {
@@ -194,6 +258,14 @@
         {tab}
       </button>
     {/each}
+    <button
+      class="ml-auto px-3 py-2 text-[11px] font-medium text-text-secondary transition-colors hover:text-accent disabled:opacity-40"
+      onclick={exportFai}
+      disabled={vesselResults.length === 0}
+      title="Export FAI results — summary + radial + angular CSV, and a full JSON"
+    >
+      ⤓ Export
+    </button>
   </div>
 
   <!-- Tab content -->

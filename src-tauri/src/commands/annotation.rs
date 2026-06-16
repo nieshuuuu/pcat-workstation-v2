@@ -928,6 +928,50 @@ pub async fn save_annotations(
     Ok(path.to_string_lossy().to_string())
 }
 
+/// Path of the unified per-patient session file under app_data/sessions.
+fn session_path(app: &tauri::AppHandle, dicom_path: &str) -> std::path::PathBuf {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .expect("app data dir")
+        .join("sessions");
+    let _ = std::fs::create_dir_all(&dir);
+    let key = Path::new(dicom_path)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| sanitize_for_filename(dicom_path));
+    dir.join(format!("{}.json", sanitize_for_filename(&key)))
+}
+
+/// Unified "save everything" — persist one per-patient session blob (seeds, FAI
+/// results, contours and water/lipid quantification). The frontend owns the JSON
+/// schema; the backend just writes/reads the opaque string, so adding fields to
+/// the session never needs a Rust change.
+#[tauri::command]
+pub async fn save_session(
+    app: tauri::AppHandle,
+    dicom_path: String,
+    session_json: String,
+) -> Result<String, String> {
+    let path = session_path(&app, &dicom_path);
+    std::fs::write(&path, session_json.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Load the unified session blob for a patient, or None if none was saved.
+#[tauri::command]
+pub async fn load_session(
+    app: tauri::AppHandle,
+    dicom_path: String,
+) -> Result<Option<String>, String> {
+    let path = session_path(&app, &dicom_path);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read failed: {e}")),
+    }
+}
+
 /// Load saved annotation state for the given patient. Restores into AppState.
 /// Returns the loaded state for the frontend to display, or None if no save exists.
 #[tauri::command]

@@ -7,9 +7,8 @@
    * Active vessel has a filled background; inactive vessels show an outline.
    */
   import { seedStore, VESSEL_COLORS, type Vessel } from '$lib/stores/seedStore.svelte';
-  import { pipelineStore } from '$lib/stores/pipelineStore.svelte';
   import { navigateToWorldPos } from '$lib/navigation';
-  import { saveSeeds, loadSeeds } from '$lib/api';
+  import { saveSession, loadSession } from '$lib/session';
   import { volumeStore } from '$lib/stores/volumeStore.svelte';
 
   let saveStatus = $state('');
@@ -18,16 +17,13 @@
     try {
       const dicomPath = volumeStore.dicomPath;
       if (!dicomPath) return;
-      // Combine seeds + pipeline results in one file
-      const data: any = JSON.parse(seedStore.exportJson());
-      if (pipelineStore.results) {
-        data.pipelineResults = pipelineStore.results;
-      }
-      await saveSeeds(JSON.stringify(data, null, 2), dicomPath);
+      // Unified save: seeds + FAI analysis + water/lipid quantification.
+      await saveSession(dicomPath);
       saveStatus = 'Saved';
       setTimeout(() => { saveStatus = ''; }, 2000);
     } catch (e) {
-      console.error('Save seeds failed:', e);
+      saveStatus = 'Save failed';
+      console.error('Save failed:', e);
     }
   }
 
@@ -35,21 +31,12 @@
     try {
       const dicomPath = volumeStore.dicomPath;
       if (!dicomPath) return;
-      const json = await loadSeeds(dicomPath);
-      if (json) {
-        seedStore.importJson(json);
-        // Restore pipeline results if present
-        try {
-          const data = JSON.parse(json);
-          if (data.pipelineResults) {
-            pipelineStore.restoreResults(data.pipelineResults);
-          }
-        } catch { /* backward compat */ }
-        saveStatus = 'Loaded';
-        setTimeout(() => { saveStatus = ''; }, 2000);
-      }
+      const meta = await loadSession(dicomPath);
+      saveStatus = meta ? 'Loaded' : 'No saved session';
+      setTimeout(() => { saveStatus = ''; }, 2500);
     } catch (e) {
-      console.error('Load seeds failed:', e);
+      saveStatus = 'Load failed';
+      console.error('Load failed:', e);
     }
   }
 
@@ -168,14 +155,14 @@
     <button
       class="rounded px-2 py-1 text-[11px] text-text-secondary hover:bg-surface-tertiary hover:text-text-primary"
       onclick={handleSaveSeeds}
-      title="Save seeds to disk"
+      title="Save everything — seeds, FAI analysis, and water/lipid quantification"
     >
       Save
     </button>
     <button
       class="rounded px-2 py-1 text-[11px] text-text-secondary hover:bg-surface-tertiary hover:text-text-primary"
       onclick={handleLoadSeeds}
-      title="Load seeds from disk"
+      title="Load the saved session — seeds, FAI, and water/lipid"
     >
       Load
     </button>

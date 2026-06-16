@@ -492,6 +492,17 @@ export async function loadAnnotations(
   return invoke<AnnotationStateJson | null>('load_annotations', { dicomPath });
 }
 
+/** Unified per-patient session blob (seeds + FAI + contours + water/lipid). The
+ *  schema is owned by `$lib/session`; the backend stores the opaque string. */
+export async function saveSession(dicomPath: string, sessionJson: string): Promise<string> {
+  return invoke<string>('save_session', { dicomPath, sessionJson });
+}
+
+/** Load the unified session blob for a patient, or null if none was saved. */
+export async function loadSession(dicomPath: string): Promise<string | null> {
+  return invoke<string | null>('load_session', { dicomPath });
+}
+
 /** Export current MMD surface data as a CSV string. */
 export async function exportMmdCsv(
   patientId: string,

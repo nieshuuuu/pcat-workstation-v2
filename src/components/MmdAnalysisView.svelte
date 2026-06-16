@@ -19,13 +19,10 @@
    */
   import {
     type AnnotationTarget,
-    type CrossSectionSurface,
-    type MmdSummary,
     generateAnnotationTargets,
     buildCprFrame,
     sampleSurfaces,
     runMmdOnRoi,
-    saveAnnotations,
     exportMmdCsv,
     useVesselWallAsContour,
     getMmdOverlay,
@@ -33,6 +30,8 @@
   } from '$lib/api';
   import { volumeStore } from '$lib/stores/volumeStore.svelte';
   import { seedStore } from '$lib/stores/seedStore.svelte';
+  import { mmdStore } from '$lib/stores/mmdStore.svelte';
+  import { saveSession, loadSession } from '$lib/session';
 
   import SnakeEditor from './SnakeEditor.svelte';
   import CrossSectionStrip from './CrossSectionStrip.svelte';
@@ -51,6 +50,16 @@
   let dicomPath = $derived(volumeStore.current?.dicomPath ?? '');
   let patientName = $derived(volumeStore.current?.patientName ?? 'unknown');
 
+  // A genuinely new patient clears stale water/lipid results; within a patient
+  // (vessel switch, or a session restore) they persist until a fresh run.
+  let lastDicom = '';
+  $effect(() => {
+    if (dicomPath && dicomPath !== lastDicom) {
+      lastDicom = dicomPath;
+      mmdStore.clear();
+    }
+  });
+
   /* ── State ───────────────────────────────────────────── */
 
   let targets = $state<AnnotationTarget[]>([]);
@@ -61,9 +70,11 @@
   let material = $state('lipid');
   let unit = $state('fraction');
 
-  let surfaces = $state<CrossSectionSurface[]>([]);
+  // Water/lipid results live in mmdStore so the unified session save/load can
+  // snapshot and restore them. Read here as derived; write via mmdStore.*.
+  let surfaces = $derived(mmdStore.surfaces);
 
-  let mmdSummary = $state<MmdSummary | null>(null);
+  let mmdSummary = $derived(mmdStore.summary);
   let mmdBusy = $state(false);
   let mmdError = $state('');
 
@@ -168,8 +179,6 @@
       selectedIndex = 0;
       snakePoints = {};
       statusMap = {};
-      surfaces = [];
-      mmdSummary = null;
       mmdError = '';
       overlayCache = {};
 
@@ -251,12 +260,28 @@
     saveBusy = true;
     saveMsg = '';
     try {
-      await saveAnnotations(dicomPath, centerlineMm);
+      await saveSession(dicomPath);
       saveMsg = 'Saved';
       setTimeout(() => { saveMsg = ''; }, 2000);
     } catch (err) {
       saveMsg = 'Save failed';
       console.error('Save failed:', err);
+    } finally {
+      saveBusy = false;
+    }
+  }
+
+  async function handleLoad() {
+    if (saveBusy || !dicomPath) return;
+    saveBusy = true;
+    saveMsg = '';
+    try {
+      const meta = await loadSession(dicomPath);
+      saveMsg = meta ? 'Loaded' : 'No saved session';
+      setTimeout(() => { saveMsg = ''; }, 2500);
+    } catch (err) {
+      saveMsg = 'Load failed';
+      console.error('Load failed:', err);
     } finally {
       saveBusy = false;
     }
@@ -352,7 +377,7 @@
     mmdError = '';
     overlayCache = {}; // stale now
     try {
-      mmdSummary = await runMmdOnRoi('gls');
+      mmdStore.summary = await runMmdOnRoi('gls');
       await refreshSurfaces();
     } catch (err) {
       mmdError = err instanceof Error ? err.message : String(err);
@@ -365,7 +390,7 @@
   async function refreshSurfaces() {
     if (material === 'ct') return; // surfaces are only defined for decomposed materials
     try {
-      surfaces = await sampleSurfaces(material, unit);
+      mmdStore.surfaces = await sampleSurfaces(material, unit);
       // The 2D (targets[]) and 3D (surfaces[]) views are linked by arc-length
       // (see targetToSurfaceIndex), so a packed surfaces vector no longer desyncs
       // them — but a mismatch still means some sections lack a 3D surface, which
@@ -460,10 +485,19 @@
         <button
           class="rounded bg-surface-tertiary px-3 py-1 text-xs font-medium text-text-primary hover:bg-surface-tertiary/80 active:bg-surface-tertiary/60 disabled:bg-surface-tertiary/40 disabled:text-text-secondary/70"
           onclick={handleSave}
-          disabled={saveBusy || targets.length === 0}
-          title="Save annotation state for this patient"
+          disabled={saveBusy || !dicomPath}
+          title="Save everything for this patient — seeds, FAI analysis, and water/lipid quantification"
         >
           {saveBusy ? 'Saving...' : 'Save'}
+        </button>
+
+        <button
+          class="rounded bg-surface-tertiary px-3 py-1 text-xs font-medium text-text-primary hover:bg-surface-tertiary/80 active:bg-surface-tertiary/60 disabled:bg-surface-tertiary/40 disabled:text-text-secondary/70"
+          onclick={handleLoad}
+          disabled={saveBusy || !dicomPath}
+          title="Load the saved session for this patient — seeds, FAI, and water/lipid"
+        >
+          Load
         </button>
 
         <button

@@ -47,6 +47,8 @@ pub fn run() {
             commands::annotation::get_mmd_overlay,
             commands::annotation::save_annotations,
             commands::annotation::load_annotations,
+            commands::annotation::save_session,
+            commands::annotation::load_session,
             commands::annotation::export_mmd_csv,
             commands::water_lipid::run_water_lipid,
             commands::water_lipid::get_wl_slice,
