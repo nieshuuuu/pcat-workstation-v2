@@ -64,6 +64,21 @@ pub async fn run_water_lipid(
     Ok(calib)
 }
 
+/// Restore a previously-saved water/lipid calibration into backend state. Used
+/// by the session loader so the whole-volume WL maps reappear on reopen without
+/// re-running the self-calibration scan. Slices are still derived on demand by
+/// `get_wl_slice`, which requires the dual-energy volume to be loaded (it is,
+/// after a patient load that has a keV pair).
+#[tauri::command]
+pub async fn restore_wl_calibration(
+    calib: WlCalibration,
+    state: tauri::State<'_, Mutex<AppState>>,
+) -> Result<(), String> {
+    let mut guard = state.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+    guard.wl_calibration = Some(calib);
+    Ok(())
+}
+
 /// Metadata header for a framed water/lipid slice response.
 #[derive(Serialize)]
 struct WlSliceMeta {

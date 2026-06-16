@@ -25,6 +25,7 @@
     type WlSlice,
     type WlAnchor,
   } from '$lib/api';
+  import { wlStore } from '$lib/stores/wlStore.svelte';
   import { jet, CT_LO, CT_HI } from '$lib/colormap';
 
   type WlMap = 'fw' | 'fl' | 'sf';

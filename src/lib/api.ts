@@ -440,6 +440,12 @@ export async function runWaterLipid(): Promise<WlCalibration> {
   return invoke<WlCalibration>('run_water_lipid');
 }
 
+/** Restore a saved water/lipid calibration into backend state (session reload),
+ *  so `getWlSlice` can derive maps again without re-running the calibration. */
+export async function restoreWlCalibration(calib: WlCalibration): Promise<void> {
+  return invoke<void>('restore_wl_calibration', { calib });
+}
+
 /** Derive one axial slice's CT + f_w + σ_f maps from the stored calibration. */
 export async function getWlSlice(z: number, anchor: WlAnchor): Promise<WlSlice> {
   const buf = await invoke<ArrayBuffer>('get_wl_slice', { z, anchor });

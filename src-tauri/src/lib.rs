@@ -52,6 +52,7 @@ pub fn run() {
             commands::annotation::export_mmd_csv,
             commands::water_lipid::run_water_lipid,
             commands::water_lipid::get_wl_slice,
+            commands::water_lipid::restore_wl_calibration,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
