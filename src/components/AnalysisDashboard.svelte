@@ -10,7 +10,7 @@
    */
   import { onMount, tick } from 'svelte';
   import { pipelineStore, type FaiStats } from '$lib/stores/pipelineStore.svelte';
-  import { VESSEL_COLORS, type Vessel } from '$lib/stores/seedStore.svelte';
+  import { seedStore, VESSEL_COLORS, type Vessel } from '$lib/stores/seedStore.svelte';
   import { volumeStore } from '$lib/stores/volumeStore.svelte';
 
   const TABS = ['Overview', 'Histograms', 'Radial Profile', 'Angular'] as const;
@@ -101,10 +101,12 @@
     downloadBlob(`${patient}_fai.json`, JSON.stringify(results, null, 2), 'application/json');
   }
 
-  // Histogram effect
+  // Histogram effect — also re-renders when the active vessel changes, so the
+  // selected vessel's histogram comes to the front (shared with the top toolbar).
   $effect(() => {
     if (activeTab !== 'Histograms' || !plotlyLoaded || !Plotly) return;
     if (!pipelineStore.results || vesselResults.length === 0) return;
+    void seedStore.activeVessel;
     tick().then(() => {
       if (!chartDiv || !Plotly) return;
       renderHistogram(Plotly, chartDiv, vesselResults);
@@ -126,12 +128,19 @@
     div: HTMLDivElement,
     data: { vessel: Vessel; stats: FaiStats }[],
   ) {
-    const traces: Partial<Plotly.Data>[] = data.map(({ vessel, stats }) => ({
+    // Draw the active vessel LAST (on top) and opaque; dim the others so the
+    // selected histogram reads clearly above the overlap. The active vessel is
+    // shared with the top toolbar's vessel selector (seedStore.activeVessel).
+    const active = seedStore.activeVessel;
+    const ordered = [...data].sort(
+      (a, b) => Number(a.vessel === active) - Number(b.vessel === active),
+    );
+    const traces: Partial<Plotly.Data>[] = ordered.map(({ vessel, stats }) => ({
       x: stats.histogram_bins,
       y: stats.histogram_counts,
       type: 'bar' as const,
       name: vessel,
-      marker: { color: VESSEL_COLORS[vessel], opacity: 0.7 },
+      marker: { color: VESSEL_COLORS[vessel], opacity: vessel === active ? 0.9 : 0.35 },
     }));
 
     const shapes: Partial<Plotly.Shape>[] = [
@@ -153,7 +162,18 @@
       autosize: true,
     };
 
-    (P as any).newPlot(div, traces, layout, { responsive: true, displayModeBar: false });
+    (P as any)
+      .newPlot(div, traces, layout, { responsive: true, displayModeBar: false })
+      .then((gd: any) => {
+        // Clicking a legend entry SELECTS that vessel (→ brings its histogram to
+        // the front) and syncs the top toolbar, instead of Plotly's default
+        // show/hide toggle. Returning false suppresses that default.
+        gd.on('plotly_legendclick', (e: any) => {
+          const v = e?.data?.[e.curveNumber]?.name as Vessel | undefined;
+          if (v) seedStore.setActiveVessel(v);
+          return false;
+        });
+      });
   }
 
   function renderRadialProfile(

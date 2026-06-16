@@ -29,6 +29,7 @@
     reuseLoadedVolume,
   } from '$lib/api';
   import type { LoadedSeriesDescriptor } from '$lib/api';
+  import { loadSession } from '$lib/session';
   import { cache as cornerstoneCache } from '@cornerstonejs/core';
   import { buildVolume } from '$lib/cornerstone/volumeLoader';
   import { volumeStore } from '$lib/stores/volumeStore.svelte';
@@ -54,6 +55,19 @@
   $effect(() => {
     getRecentDicoms().then((paths) => { recentPaths = paths; }).catch(() => {});
   });
+
+  /** Auto-restore the full saved session (seeds + FAI + water/lipid) for a
+   *  patient on open. Falls back to legacy seeds-only saves so patients saved
+   *  before the unified session still restore their seeds. */
+  async function autoRestoreSession(dicomPath: string) {
+    try {
+      const meta = await loadSession(dicomPath);
+      if (!meta) {
+        const seedsJson = await loadSeeds(dicomPath);
+        if (seedsJson) seedStore.importJson(seedsJson);
+      }
+    } catch { /* no saved session/seeds for this patient */ }
+  }
 
   // Clear stale FAI/pipeline results (and their overlay) when the centerline is
   // removed — deleting seeds, Escape, or switching patient. Without this the FAI
@@ -231,10 +245,7 @@
           volumeStore.setCornerstoneVolumeId(fastCsId);
           volumeStore.setLoadProgress(100);
           volumeStore.setLoading(false);
-          try {
-            const seedsJson = await loadSeeds(path);
-            if (seedsJson) seedStore.importJson(seedsJson);
-          } catch { /* no saved seeds */ }
+          await autoRestoreSession(path);
           getRecentDicoms().then((paths) => { recentPaths = paths; }).catch(() => {});
           return;
         }
@@ -270,12 +281,7 @@
       volumeStore.setLoading(false);
 
       // 5. Auto-load seeds for this patient.
-      try {
-        const seedsJson = await loadSeeds(path);
-        if (seedsJson) {
-          seedStore.importJson(seedsJson);
-        }
-      } catch { /* no saved seeds for this patient */ }
+      await autoRestoreSession(path);
 
       // 6. Refresh recent list.
       getRecentDicoms().then((paths) => { recentPaths = paths; }).catch(() => {});
@@ -361,10 +367,7 @@
       volumeStore.setLoadProgress(100);
       volumeStore.setLoading(false);
 
-      try {
-        const seedsJson = await loadSeeds(lowDir);
-        if (seedsJson) seedStore.importJson(seedsJson);
-      } catch { /* no saved seeds */ }
+      await autoRestoreSession(lowDir);
 
       getRecentDicoms().then((paths) => { recentPaths = paths; }).catch(() => {});
     } catch (e) {
@@ -476,10 +479,7 @@
       volumeStore.setLoadMessage('');
       volumeStore.setLoading(false);
 
-      try {
-        const seedsJson = await loadSeeds(active.path);
-        if (seedsJson) seedStore.importJson(seedsJson);
-      } catch { /* no saved seeds */ }
+      await autoRestoreSession(active.path);
 
       if (result.failures.length > 0) {
         errorMessage = `Loaded ${result.series.length} series; skipped: ${result.failures.join('; ')}`;

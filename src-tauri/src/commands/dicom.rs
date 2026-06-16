@@ -967,27 +967,31 @@ pub async fn load_patient_all(
             },
         );
 
-        let scan = match dicom_scan::scan_series(&series_dir).await {
-            Ok(s) => s,
+        // Quick-scan: one header + a file count, NOT a header read of every
+        // slice. The full per-slice scan happens lazily inside the Phase-2
+        // decode (only for the series actually decoded), so reading all headers
+        // here was redundant — and dominated the load time on SMB.
+        let qs = match dicom_scan::quick_scan_series(&series_dir).await {
+            Ok(Some(q)) => q,
+            Ok(None) => {
+                failures.push(format!("{name}: no DICOM series found"));
+                continue;
+            }
             Err(e) => {
                 failures.push(format!("{name}: scan failed: {e}"));
                 continue;
             }
         };
-        let Some(first) = scan.into_iter().next() else {
-            failures.push(format!("{name}: no DICOM series found"));
-            continue;
-        };
 
         descriptors.push(LoadedSeriesDescriptor {
             name: name.clone(),
             path: series_dir.to_string_lossy().into_owned(),
-            uid: first.uid.clone(),
-            series_description: first.description.clone(),
+            uid: qs.uid,
+            series_description: qs.description,
             kev: parse_kev_from_folder(&name),
-            num_slices: first.num_slices,
-            rows: first.rows as usize,
-            cols: first.cols as usize,
+            num_slices: qs.num_slices,
+            rows: qs.rows as usize,
+            cols: qs.cols as usize,
         });
         series_dirs.push(series_dir);
     }
@@ -1004,33 +1008,39 @@ pub async fn load_patient_all(
         ));
     }
 
-    // Pick the default active volume: CCTA-like name first, else lowest keV,
-    // else first in sort order.
-    let active_index = descriptors
-        .iter()
-        .position(|d| {
-            let n = d.name.to_ascii_lowercase();
-            n.contains("ccta")
-        })
-        .or_else(|| {
-            // Lowest-keV MonoPlus.
-            let mut best: Option<(usize, f64)> = None;
-            for (i, d) in descriptors.iter().enumerate() {
-                if let Some(k) = d.kev {
-                    if best.map(|(_, bk)| k < bk).unwrap_or(true) {
-                        best = Some((i, k));
-                    }
+    // CCTA-like series (high-res contrast scan), if present — used for the
+    // centerline, so it's decoded up front even though it isn't the default view.
+    let ccta_index = descriptors.iter().position(|d| {
+        let n = d.name.to_ascii_lowercase();
+        n.contains("ccta")
+    });
+    // Lowest-keV MonoPlus index, if any.
+    let lowest_kev_index = {
+        let mut best: Option<(usize, f64)> = None;
+        for (i, d) in descriptors.iter().enumerate() {
+            if let Some(k) = d.kev {
+                if best.map(|(_, bk)| k < bk).unwrap_or(true) {
+                    best = Some((i, k));
                 }
             }
-            best.map(|(i, _)| i)
-        })
-        .unwrap_or(0);
+        }
+        best.map(|(i, _)| i)
+    };
 
-    // Phase 2 — decode ONLY the series needed right now: the active one (for the
-    // viewport) plus the dual-energy keV pair (lowest + highest, for MMD /
-    // water-lipid). Everything else stays scanned-but-not-decoded and is decoded
-    // on first switch in `set_active_volume`. This is what makes the load fast.
+    // Default the displayed volume to the lowest-keV series (e.g. 70 keV): the
+    // low-keV image has the highest soft-tissue/fat contrast, which is where
+    // pericoronary-fat annotation is done. Fall back to CCTA, then first.
+    let active_index = lowest_kev_index.or(ccta_index).unwrap_or(0);
+
+    // Phase 2 — decode ONLY the series the clinician needs right away: the
+    // displayed one (lowest keV), the dual-energy keV pair (lowest + highest, for
+    // MMD / water-lipid), and the CCTA (for the centerline). Everything else
+    // (e.g. CA_SCORING) stays scanned-but-not-decoded and is decoded on first
+    // switch in `set_active_volume`. This is what keeps the load fast.
     let mut need: Vec<usize> = vec![active_index];
+    if let Some(c) = ccta_index {
+        need.push(c);
+    }
     {
         let mut kevs: Vec<(usize, f64)> = descriptors
             .iter()

@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 
 use dicom::core::Tag;
 use dicom::dictionary_std::tags;
-use dicom::object::{FileDicomObject, InMemDicomObject, OpenFileOptions};
+use dicom::object::{open_file, FileDicomObject, InMemDicomObject, OpenFileOptions};
 
+use crate::dicom_decode::decode_pixels_from_obj;
 use crate::dicom_errors::DicomLoadError;
 
 /// DICOM tag for ImageComments (0020,4000) — MonoPlus keV truth per lab finding.
@@ -55,23 +56,54 @@ pub fn read_header(path: &Path) -> Result<Option<SliceHeader>, DicomLoadError> {
         // Not a valid DICOM file — skip silently.
         Err(_) => return Ok(None),
     };
+    Ok(header_from_obj(&obj, path))
+}
 
+/// Read a slice's header AND decode its pixels from a SINGLE file open. This is
+/// the single-pass path: scan-then-decode opens every file twice (header read,
+/// then pixel read) — costly on SMB where each open is a round-trip — whereas
+/// this reads the full object once and pulls both header and pixels from it.
+/// Returns `Ok(None)` for files that are not image-DICOM slices.
+pub fn read_slice_with_pixels(
+    path: &Path,
+) -> Result<Option<(SliceHeader, Vec<i16>)>, DicomLoadError> {
+    // Full open (header + pixel data) — one round-trip, unlike read_header's
+    // read_until(PIXEL_DATA).
+    let obj = match open_file(path) {
+        Ok(o) => o,
+        Err(_) => return Ok(None),
+    };
+    let Some(header) = header_from_obj(&obj, path) else {
+        return Ok(None);
+    };
+    let pixels = decode_pixels_from_obj(&obj, path, header.rows, header.cols)?;
+    Ok(Some((header, pixels)))
+}
+
+/// Extract the indexing/grouping fields from an already-open DICOM object.
+/// Returns `None` when the object is not an image series instance (no
+/// SeriesInstanceUID, or zero rows/cols — SR, KO, PR, etc.). Shared by
+/// `read_header` (header-only open) and `read_slice_with_pixels` (full open).
+fn header_from_obj(
+    obj: &FileDicomObject<InMemDicomObject>,
+    path: &Path,
+) -> Option<SliceHeader> {
     // If there is no SeriesInstanceUID, this is not an image series instance.
-    let series_uid = match read_string(&obj, tags::SERIES_INSTANCE_UID) {
+    let series_uid = match read_string(obj, tags::SERIES_INSTANCE_UID) {
         Some(s) if !s.is_empty() => s,
-        _ => return Ok(None),
+        _ => return None,
     };
 
-    let rows = read_u32(&obj, tags::ROWS).unwrap_or(0);
-    let cols = read_u32(&obj, tags::COLUMNS).unwrap_or(0);
+    let rows = read_u32(obj, tags::ROWS).unwrap_or(0);
+    let cols = read_u32(obj, tags::COLUMNS).unwrap_or(0);
     if rows == 0 || cols == 0 {
         // Non-image DICOM (SR, KO, PR, etc.) — skip.
-        return Ok(None);
+        return None;
     }
 
-    let pixel_spacing = read_multi_f64(&obj, tags::PIXEL_SPACING);
-    let orient = read_multi_f64(&obj, tags::IMAGE_ORIENTATION_PATIENT);
-    let ipp = read_multi_f64(&obj, tags::IMAGE_POSITION_PATIENT);
+    let pixel_spacing = read_multi_f64(obj, tags::PIXEL_SPACING);
+    let orient = read_multi_f64(obj, tags::IMAGE_ORIENTATION_PATIENT);
+    let ipp = read_multi_f64(obj, tags::IMAGE_POSITION_PATIENT);
 
     let image_position_patient = if ipp.len() >= 3 {
         Some([ipp[0], ipp[1], ipp[2]])
@@ -79,18 +111,18 @@ pub fn read_header(path: &Path) -> Result<Option<SliceHeader>, DicomLoadError> {
         None
     };
 
-    Ok(Some(SliceHeader {
+    Some(SliceHeader {
         path: path.to_path_buf(),
         series_uid,
-        series_description: read_string(&obj, tags::SERIES_DESCRIPTION).unwrap_or_default(),
-        image_comments: read_string(&obj, IMAGE_COMMENTS),
-        instance_number: read_i32(&obj, tags::INSTANCE_NUMBER),
+        series_description: read_string(obj, tags::SERIES_DESCRIPTION).unwrap_or_default(),
+        image_comments: read_string(obj, IMAGE_COMMENTS),
+        instance_number: read_i32(obj, tags::INSTANCE_NUMBER),
         image_position_z: image_position_patient.map(|p| p[2]),
         image_position_patient,
         rows,
         cols,
-        rescale_slope: read_f64(&obj, tags::RESCALE_SLOPE).unwrap_or(1.0),
-        rescale_intercept: read_f64(&obj, tags::RESCALE_INTERCEPT).unwrap_or(0.0),
+        rescale_slope: read_f64(obj, tags::RESCALE_SLOPE).unwrap_or(1.0),
+        rescale_intercept: read_f64(obj, tags::RESCALE_INTERCEPT).unwrap_or(0.0),
         pixel_spacing: if pixel_spacing.len() >= 2 {
             [pixel_spacing[0], pixel_spacing[1]]
         } else {
@@ -101,11 +133,11 @@ pub fn read_header(path: &Path) -> Result<Option<SliceHeader>, DicomLoadError> {
         } else {
             [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
         },
-        patient_name: read_string(&obj, tags::PATIENT_NAME).unwrap_or_default(),
-        study_description: read_string(&obj, tags::STUDY_DESCRIPTION).unwrap_or_default(),
-        window_center: read_f64(&obj, tags::WINDOW_CENTER).unwrap_or(40.0),
-        window_width: read_f64(&obj, tags::WINDOW_WIDTH).unwrap_or(400.0),
-    }))
+        patient_name: read_string(obj, tags::PATIENT_NAME).unwrap_or_default(),
+        study_description: read_string(obj, tags::STUDY_DESCRIPTION).unwrap_or_default(),
+        window_center: read_f64(obj, tags::WINDOW_CENTER).unwrap_or(40.0),
+        window_width: read_f64(obj, tags::WINDOW_WIDTH).unwrap_or(400.0),
+    })
 }
 
 fn read_string(obj: &FileDicomObject<InMemDicomObject>, tag: Tag) -> Option<String> {
@@ -235,13 +267,73 @@ pub async fn scan_series(dir: &Path) -> Result<Vec<SeriesDescriptor>, DicomLoadE
         return Err(DicomLoadError::NoDicoms { scanned, skipped });
     }
 
-    let groups = group_by_series(valid);
+    Ok(descriptors_from_headers(valid))
+}
+
+/// Group already-read slice headers by series and build one sorted descriptor
+/// per series. This is the post-I/O half of `scan_series`, factored out so the
+/// single-pass loader (`dicom_load::load_series`) can reuse the exact same
+/// grouping + z-ordering after reading headers and pixels in one pass.
+pub fn descriptors_from_headers(headers: Vec<SliceHeader>) -> Vec<SeriesDescriptor> {
+    let groups = group_by_series(headers);
     let mut descriptors: Vec<SeriesDescriptor> = groups
         .into_iter()
         .map(|(uid, slices)| descriptor_from_slices(uid, slices))
         .collect();
     descriptors.sort_by(|a, b| a.uid.cmp(&b.uid));
-    Ok(descriptors)
+    descriptors
+}
+
+/// Summary of a series folder cheap enough to compute on a network mount:
+/// one header read for the identity tags + a directory file-count for the slice
+/// count. `num_slices` is the file count (a display/selection hint — the
+/// authoritative count comes from the decode), so it assumes one series per
+/// folder, which matches how `load_patient_all` already consumes the scan.
+#[derive(Debug, Clone)]
+pub struct QuickSeries {
+    pub uid: String,
+    pub description: String,
+    pub num_slices: usize,
+    pub rows: u32,
+    pub cols: u32,
+}
+
+/// Fast per-series summary: read the directory once and parse only ONE header,
+/// instead of `scan_series`'s header read of every slice. On an SMB share this
+/// turns ~hundreds of round-trips per series into ~2. Returns `Ok(None)` when no
+/// file in the folder parses as an image-DICOM slice.
+pub async fn quick_scan_series(dir: &Path) -> Result<Option<QuickSeries>, DicomLoadError> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_file() {
+            files.push(entry.path());
+        }
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+    files.sort();
+    let num_slices = files.len();
+
+    // Read headers until one parses — the first file is almost always a valid
+    // slice, so this is a single round-trip in practice.
+    for p in files {
+        let header = tokio::task::spawn_blocking(move || read_header(&p).ok().flatten())
+            .await
+            .ok()
+            .flatten();
+        if let Some(h) = header {
+            return Ok(Some(QuickSeries {
+                uid: h.series_uid,
+                description: h.series_description,
+                num_slices,
+                rows: h.rows,
+                cols: h.cols,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 fn descriptor_from_slices(uid: String, slices: Vec<SliceHeader>) -> SeriesDescriptor {
