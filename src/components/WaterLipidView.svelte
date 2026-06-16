@@ -32,7 +32,9 @@
 
   /* ── State ──────────────────────────────────────────────── */
 
-  let calib = $state<WlCalibration | null>(null);
+  // Single source of truth is wlStore, so a calibration restored from a saved
+  // session (or set by a Run) drives this view and is captured by session save.
+  let calib = $derived(wlStore.calibration);
   let running = $state(false);
   let error = $state('');
 
@@ -111,12 +113,13 @@
     running = true;
     error = '';
     try {
-      calib = await runWaterLipid();
-      z = Math.floor((calib.dims[0] - 1) / 2); // start at mid-volume (heart)
-      // The fetch effect (tracks calib + z + anchor) loads the slice.
+      // calib is derived from wlStore; setting the store updates the view AND
+      // makes the calibration part of the unified session save. z + slice fetch
+      // are handled by the effects below (which also fire on session restore).
+      wlStore.set(await runWaterLipid());
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
-      calib = null;
+      wlStore.reset();
     } finally {
       running = false;
     }
@@ -151,6 +154,17 @@
       }
     }
   }
+
+  // When a new calibration appears (fresh Run, or one restored from a saved
+  // session), jump to the mid-volume slice (heart). Track identity so unrelated
+  // reactive ticks don't reset the user's slice position.
+  let lastCalibForZ: WlCalibration | null = null;
+  $effect(() => {
+    if (calib && calib !== lastCalibForZ) {
+      z = Math.floor((calib.dims[0] - 1) / 2);
+    }
+    lastCalibForZ = calib;
+  });
 
   // Refetch when the calibration (run/re-run), slice index or anchor changes.
   // The selected map and CT-only toggle only re-render — no refetch.

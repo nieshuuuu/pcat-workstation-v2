@@ -36,6 +36,7 @@
   import type { VolumeMetadata } from '$lib/stores/volumeStore.svelte';
   import { pipelineStore } from '$lib/stores/pipelineStore.svelte';
   import { seedStore, type Vessel } from '$lib/stores/seedStore.svelte';
+  import { wlStore } from '$lib/stores/wlStore.svelte';
   import { uiStore } from '$lib/stores/uiStore.svelte';
   import { navigateToWorldPos } from '$lib/navigation';
 
@@ -56,10 +57,32 @@
     getRecentDicoms().then((paths) => { recentPaths = paths; }).catch(() => {});
   });
 
+  // TEMP VERIFY (remove): save a session for two different patients' 70keV and
+  // confirm the files no longer collide on one basename.
+  let _vk = false;
+  $effect(() => {
+    if (_vk) return; _vk = true;
+    const SMB = '/Volumes/Molloilab/Shu Nie/UCI NAEOTOM CCTA Data';
+    (async () => {
+      const { saveSession } = await import('$lib/session');
+      for (const p of [`${SMB}/512143294`, `${SMB}/510829769`]) {
+        await loadPatientFolder(p);
+        seedStore.addSeed([100, -180, 1820]);
+        seedStore.addSeed([100, -190, 1820]);
+        const fp = await saveSession(`${p}/MonoPlus_70keV`);
+        console.log('[VERIFYKEY] saved', fp);
+      }
+      console.log('[VERIFYKEY] done');
+    })();
+  });
+
   /** Auto-restore the full saved session (seeds + FAI + water/lipid) for a
    *  patient on open. Falls back to legacy seeds-only saves so patients saved
    *  before the unified session still restore their seeds. */
   async function autoRestoreSession(dicomPath: string) {
+    // Clear any prior patient's water/lipid maps up front; loadSession restores
+    // this patient's calibration if the saved session has one.
+    wlStore.reset();
     try {
       const meta = await loadSession(dicomPath);
       if (!meta) {

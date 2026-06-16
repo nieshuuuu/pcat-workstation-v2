@@ -11,10 +11,11 @@
  * everything; one loadSession() restores it into the stores.
  */
 
-import { saveSession as saveSessionCmd, loadSession as loadSessionCmd } from '$lib/api';
+import { saveSession as saveSessionCmd, loadSession as loadSessionCmd, restoreWlCalibration } from '$lib/api';
 import { seedStore } from '$lib/stores/seedStore.svelte';
 import { pipelineStore } from '$lib/stores/pipelineStore.svelte';
 import { mmdStore } from '$lib/stores/mmdStore.svelte';
+import { wlStore } from '$lib/stores/wlStore.svelte';
 
 const SESSION_VERSION = 1;
 
@@ -29,6 +30,8 @@ export async function saveSession(dicomPath: string): Promise<void> {
     seeds: JSON.parse(seedStore.exportJson()),
     fai: pipelineStore.results,
     mmd: { summary: mmdStore.summary, surfaces: mmdStore.surfaces },
+    // Whole-volume water/lipid calibration (the SSoT; f_w/σ_f maps derive from it).
+    wl: wlStore.calibration,
   };
   await saveSessionCmd(dicomPath, JSON.stringify(bundle));
 }
@@ -43,5 +46,14 @@ export async function loadSession(dicomPath: string): Promise<SessionMeta | null
   if (bundle.seeds) seedStore.importJson(JSON.stringify(bundle.seeds));
   if (bundle.fai) pipelineStore.restoreResults(bundle.fai);
   if (bundle.mmd) mmdStore.restore(bundle.mmd);
+  if (bundle.wl) {
+    wlStore.restore(bundle.wl);
+    // Push the calibration back into backend state so getWlSlice can derive maps.
+    // Best-effort: requires the dual-energy volume to be loaded (it is after a
+    // patient load with a keV pair); a single-series open has no WL to restore.
+    try { await restoreWlCalibration(bundle.wl); } catch { /* dual-energy not loaded */ }
+  } else {
+    wlStore.reset();
+  }
   return { savedAt: bundle.savedAt ?? '' };
 }

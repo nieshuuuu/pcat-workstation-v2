@@ -1313,6 +1313,17 @@ pub async fn set_active_volume_meta(
 mod tests {
     use super::*;
 
+    /// Regression: every patient folder contains a `MonoPlus_70keV` series, so a
+    /// last-component-only key collided and loaded one patient's saved session
+    /// onto another. The key must be patient-unique (full path embedded).
+    #[test]
+    fn patient_file_key_unique_across_patients_with_same_series_name() {
+        let a = patient_file_key("/data/512143294/MonoPlus_70keV");
+        let b = patient_file_key("/data/510829769/MonoPlus_70keV");
+        assert_ne!(a, b, "different patients sharing a series name must not collide");
+        assert!(a.ends_with(".json") && b.ends_with(".json"));
+    }
+
     /// Minimal single-column volume: `z_positions.len()` slices, in-plane
     /// `rows×cols`, every voxel = `fill`.
     fn make_vol(z_positions: &[f64], rows: u32, cols: u32, fill: i16) -> PipelineLoadedVolume {
