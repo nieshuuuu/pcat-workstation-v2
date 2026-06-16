@@ -55,19 +55,6 @@
     getRecentDicoms().then((paths) => { recentPaths = paths; }).catch(() => {});
   });
 
-  // TEMP VERIFY (remove): load fresh SMB patients to measure single-pass + check 70keV default.
-  let _v = false;
-  $effect(() => {
-    if (_v) return; _v = true;
-    const SMB = '/Volumes/Molloilab/Shu Nie/UCI NAEOTOM CCTA Data';
-    (async () => {
-      for (const p of [`${SMB}/510132786`, `${SMB}/512190591`]) {
-        await loadPatientFolder(p).catch((e) => console.error(e));
-      }
-      console.log('[VERIFY] done');
-    })();
-  });
-
   // Clear stale FAI/pipeline results (and their overlay) when the centerline is
   // removed — deleting seeds, Escape, or switching patient. Without this the FAI
   // heatmap lingers on screen after the centerline it was computed from is gone.

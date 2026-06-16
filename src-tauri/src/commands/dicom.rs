@@ -1056,12 +1056,6 @@ pub async fn load_patient_all(
     need.sort_unstable();
     need.dedup();
 
-    eprintln!(
-        "[VERIFY] active='{}'  decoding up-front: {:?}",
-        descriptors[active_index].name,
-        need.iter().map(|&i| descriptors[i].name.as_str()).collect::<Vec<_>>()
-    ); // TEMP VERIFY
-
     let decode_started = std::time::Instant::now();
     let n_need = need.len();
     for (k, &idx) in need.iter().enumerate() {
