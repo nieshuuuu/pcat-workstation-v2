@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use dicom::object::open_file;
+use dicom::object::{open_file, FileDicomObject, InMemDicomObject};
 use dicom_pixeldata::PixelDecoder;
 
 use crate::dicom_errors::DicomLoadError;
@@ -25,6 +25,19 @@ pub fn decode_slice_i16(
         path: path.to_path_buf(),
         reason: e.to_string(),
     })?;
+    decode_pixels_from_obj(&obj, path, expected_rows, expected_cols)
+}
+
+/// Decode pixel data from an already-open DICOM object — the single-open path
+/// used by `dicom_scan::read_slice_with_pixels` so a slice's header and pixels
+/// come from ONE file open (halving SMB round-trips vs scan-then-decode).
+/// `decode_slice_i16` is the convenience wrapper that opens the file first.
+pub fn decode_pixels_from_obj(
+    obj: &FileDicomObject<InMemDicomObject>,
+    path: &Path,
+    expected_rows: u32,
+    expected_cols: u32,
+) -> Result<Vec<i16>, DicomLoadError> {
     let decoded = obj
         .decode_pixel_data()
         .map_err(|e| DicomLoadError::DecodeFailed {
