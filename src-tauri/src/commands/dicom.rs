@@ -967,27 +967,31 @@ pub async fn load_patient_all(
             },
         );
 
-        let scan = match dicom_scan::scan_series(&series_dir).await {
-            Ok(s) => s,
+        // Quick-scan: one header + a file count, NOT a header read of every
+        // slice. The full per-slice scan happens lazily inside the Phase-2
+        // decode (only for the series actually decoded), so reading all headers
+        // here was redundant — and dominated the load time on SMB.
+        let qs = match dicom_scan::quick_scan_series(&series_dir).await {
+            Ok(Some(q)) => q,
+            Ok(None) => {
+                failures.push(format!("{name}: no DICOM series found"));
+                continue;
+            }
             Err(e) => {
                 failures.push(format!("{name}: scan failed: {e}"));
                 continue;
             }
         };
-        let Some(first) = scan.into_iter().next() else {
-            failures.push(format!("{name}: no DICOM series found"));
-            continue;
-        };
 
         descriptors.push(LoadedSeriesDescriptor {
             name: name.clone(),
             path: series_dir.to_string_lossy().into_owned(),
-            uid: first.uid.clone(),
-            series_description: first.description.clone(),
+            uid: qs.uid,
+            series_description: qs.description,
             kev: parse_kev_from_folder(&name),
-            num_slices: first.num_slices,
-            rows: first.rows as usize,
-            cols: first.cols as usize,
+            num_slices: qs.num_slices,
+            rows: qs.rows as usize,
+            cols: qs.cols as usize,
         });
         series_dirs.push(series_dir);
     }

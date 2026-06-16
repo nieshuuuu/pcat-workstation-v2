@@ -71,9 +71,11 @@
       const r: any = e.reason;
       devReport(`unhandledrejection: ${r?.message ?? r}\n${r?.stack ?? ''}`);
     });
-    const LOCAL = '/Users/shunie/Developer/PCAT/UCI NAEOTOM CCTA Data';
+    const SMB = '/Volumes/Molloilab/Shu Nie/UCI NAEOTOM CCTA Data';
     const targets = [
-      `${LOCAL}/58334832`,  // local — isolates release-vs-dev from SMB latency
+      `${SMB}/512011360`,  // fresh (not loaded this session) — measures quick-scan
+      `${SMB}/512143294`,
+      `${SMB}/512339528`,
     ];
     (async () => {
       for (const t of targets) {

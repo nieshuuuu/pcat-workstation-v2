@@ -244,6 +244,58 @@ pub async fn scan_series(dir: &Path) -> Result<Vec<SeriesDescriptor>, DicomLoadE
     Ok(descriptors)
 }
 
+/// Summary of a series folder cheap enough to compute on a network mount:
+/// one header read for the identity tags + a directory file-count for the slice
+/// count. `num_slices` is the file count (a display/selection hint — the
+/// authoritative count comes from the decode), so it assumes one series per
+/// folder, which matches how `load_patient_all` already consumes the scan.
+#[derive(Debug, Clone)]
+pub struct QuickSeries {
+    pub uid: String,
+    pub description: String,
+    pub num_slices: usize,
+    pub rows: u32,
+    pub cols: u32,
+}
+
+/// Fast per-series summary: read the directory once and parse only ONE header,
+/// instead of `scan_series`'s header read of every slice. On an SMB share this
+/// turns ~hundreds of round-trips per series into ~2. Returns `Ok(None)` when no
+/// file in the folder parses as an image-DICOM slice.
+pub async fn quick_scan_series(dir: &Path) -> Result<Option<QuickSeries>, DicomLoadError> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_file() {
+            files.push(entry.path());
+        }
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+    files.sort();
+    let num_slices = files.len();
+
+    // Read headers until one parses — the first file is almost always a valid
+    // slice, so this is a single round-trip in practice.
+    for p in files {
+        let header = tokio::task::spawn_blocking(move || read_header(&p).ok().flatten())
+            .await
+            .ok()
+            .flatten();
+        if let Some(h) = header {
+            return Ok(Some(QuickSeries {
+                uid: h.series_uid,
+                description: h.series_description,
+                num_slices,
+                rows: h.rows,
+                cols: h.cols,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 fn descriptor_from_slices(uid: String, slices: Vec<SliceHeader>) -> SeriesDescriptor {
     let first = &slices[0];
     let rows = first.rows;
