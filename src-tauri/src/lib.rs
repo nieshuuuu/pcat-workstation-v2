@@ -26,7 +26,6 @@ pub fn run() {
             commands::dicom::load_patient_all,
             commands::dicom::set_active_volume,
             commands::dicom::set_active_volume_meta,
-            commands::dicom::dev_report,
             commands::dicom::list_patients,
             commands::dicom::list_series_dirs,
             commands::cpr::build_cpr_frame,

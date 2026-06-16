@@ -27,7 +27,6 @@
     setActiveVolumeMeta,
     onDicomLoadProgress,
     reuseLoadedVolume,
-    devReport,
   } from '$lib/api';
   import type { LoadedSeriesDescriptor } from '$lib/api';
   import { cache as cornerstoneCache } from '@cornerstonejs/core';
@@ -55,50 +54,6 @@
   $effect(() => {
     getRecentDicoms().then((paths) => { recentPaths = paths; }).catch(() => {});
   });
-
-  // ===== TEMP DEV AUTO-REPRO (remove before release) =====
-  // Reproduces "Patients → load" + series switching across the user's actual
-  // SMB patients and pipes every error (incl. uncaught rejections + stacks) to
-  // the dev terminal via dev_report.
-  let _reproDone = false;
-  $effect(() => {
-    if (_reproDone) return;
-    _reproDone = true;
-    window.addEventListener('error', (e) => {
-      devReport(`window.error: ${e.message}\n${e.error?.stack ?? ''}`);
-    });
-    window.addEventListener('unhandledrejection', (e) => {
-      const r: any = e.reason;
-      devReport(`unhandledrejection: ${r?.message ?? r}\n${r?.stack ?? ''}`);
-    });
-    const SMB = '/Volumes/Molloilab/Shu Nie/UCI NAEOTOM CCTA Data';
-    const targets = [
-      `${SMB}/512011360`,  // fresh (not loaded this session) — measures quick-scan
-      `${SMB}/512143294`,
-      `${SMB}/512339528`,
-    ];
-    (async () => {
-      for (const t of targets) {
-        try {
-          devReport(`AUTO-REPRO: loadPatientFolder ${t}`);
-          await loadPatientFolder(t);
-          devReport(`AUTO-REPRO: loaded; switching through ${volumeStore.loaded.length} series`);
-          for (const s of [...volumeStore.loaded]) {
-            try {
-              await switchToLoaded(s);
-              devReport(`AUTO-REPRO:   switched OK -> ${s.name}`);
-            } catch (e: any) {
-              devReport(`AUTO-REPRO:   switch THREW on ${s.name}: ${e?.message ?? e}\n${e?.stack ?? ''}`);
-            }
-          }
-        } catch (e: any) {
-          devReport(`AUTO-REPRO: load THREW on ${t}: ${e?.message ?? e}\n${e?.stack ?? ''}`);
-        }
-      }
-      devReport('AUTO-REPRO: DONE');
-    })();
-  });
-  // ===== END TEMP DEV AUTO-REPRO =====
 
   // Clear stale FAI/pipeline results (and their overlay) when the centerline is
   // removed — deleting seeds, Escape, or switching patient. Without this the FAI
@@ -536,7 +491,6 @@
       volumeStore.setLoadMessage('');
       errorMessage = e instanceof Error ? e.message : String(e);
       console.error('Failed to load patient:', e);
-      devReport(`loadPatientFolder catch: ${e instanceof Error ? e.message : String(e)}\n${(e as any)?.stack ?? ''}`); // TEMP DEV
     } finally {
       if (unlistenProgress) unlistenProgress();
     }
