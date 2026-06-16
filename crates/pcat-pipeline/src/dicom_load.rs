@@ -4,15 +4,15 @@
 //! decodes pixel data in parallel (rayon) and returns a densely packed i16
 //! volume in z-major order.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
-use crate::dicom_decode::decode_slice_i16;
 use crate::dicom_errors::DicomLoadError;
-use crate::dicom_scan::{scan_series, SeriesDescriptor};
+use crate::dicom_scan::{descriptors_from_headers, read_slice_with_pixels, SeriesDescriptor, SliceHeader};
 
 /// 4 GB soft limit (conservative — covers 1000-slice 512² i16 at 1.5 GB).
 const VOLUME_SIZE_LIMIT_MB: usize = 4096;
@@ -99,74 +99,114 @@ pub async fn load_series(
     uid: &str,
     on_progress: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
 ) -> Result<LoadedVolume, DicomLoadError> {
-    let descriptors = scan_series(dir).await?;
-    let desc = descriptors
-        .into_iter()
-        .find(|d| d.uid == uid)
-        .ok_or_else(|| DicomLoadError::SeriesNotFound { uid: uid.to_string() })?;
-
-    let slice_len = (desc.rows as usize) * (desc.cols as usize);
-    let total_voxels = slice_len * desc.num_slices;
-    let total_bytes_mb = (total_voxels * 2) / (1024 * 1024);
-    check_volume_size_mb(total_bytes_mb)?;
-
-    // Emit initial progress (gives the frontend the total slice count).
-    if let Some(ref cb) = on_progress {
-        cb(0, desc.num_slices);
+    // Single directory round-trip to enumerate candidate files. Header AND
+    // pixels then come from ONE open per file below (see `read_slice_with_pixels`),
+    // instead of the old scan-then-decode which opened every file twice — the
+    // second open was the dominant cost on SMB.
+    let mut file_paths: Vec<PathBuf> = Vec::new();
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_file() {
+            file_paths.push(entry.path());
+        }
     }
+    if file_paths.is_empty() {
+        return Err(DicomLoadError::NoDicoms { scanned: 0, skipped: 0 });
+    }
+    file_paths.sort();
+    let total_files = file_paths.len();
 
-    let file_paths = desc.file_paths.clone();
-    let rescale_slope = desc.rescale_slope;
-    let rescale_intercept = desc.rescale_intercept;
-    let rows = desc.rows;
-    let cols = desc.cols;
-    let total = desc.num_slices;
+    // Emit initial progress (`total_files` ≈ slice count for a single-series
+    // folder; the exact count is known after grouping below).
+    if let Some(ref cb) = on_progress {
+        cb(0, total_files);
+    }
+    let progress = on_progress.map(Arc::new);
+    let uid_owned = uid.to_string();
     let dir_owned = dir.to_path_buf();
 
-    // Wrap callback in Arc so it can be shared across rayon threads inside
-    // spawn_blocking.
-    let progress = on_progress.map(Arc::new);
+    let (metadata, voxels) = tokio::task::spawn_blocking(
+        move || -> Result<(VolumeMetadata, Vec<i16>), DicomLoadError> {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let step = (total_files / 50).max(1);
 
-    let voxels = tokio::task::spawn_blocking(move || {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let step = (total / 50).max(1);
-
-        let mut out = vec![0i16; total_voxels];
-
-        // Decode on a high-concurrency pool so many SMB reads overlap (see
-        // READ_CONCURRENCY). Fall back to the global rayon pool if the dedicated
-        // one can't be built.
-        let run = || -> Vec<Result<(usize, Vec<i16>), DicomLoadError>> {
-            file_paths
-                .par_iter()
-                .enumerate()
-                .map(|(z, p)| {
-                    let px = decode_slice_i16(p, rescale_slope, rescale_intercept, rows, cols)
-                        .map(|px| (z, px));
-                    // Increment counter and emit if on a reporting boundary.
-                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if let Some(ref cb) = progress {
-                        if done % step == 0 || done == total {
-                            cb(done, total);
+            // One open per file → (header, pixels). High-concurrency pool so the
+            // SMB round-trips overlap. Propagates the first hard decode error.
+            let run = || -> Result<Vec<(SliceHeader, Vec<i16>)>, DicomLoadError> {
+                file_paths
+                    .par_iter()
+                    .map(|p| {
+                        let res = read_slice_with_pixels(p);
+                        let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Some(ref cb) = progress {
+                            if done % step == 0 || done == total_files {
+                                cb(done, total_files);
+                            }
                         }
-                    }
-                    px
-                })
-                .collect()
-        };
-        let results = match rayon::ThreadPoolBuilder::new()
-            .num_threads(READ_CONCURRENCY)
-            .build()
-        {
-            Ok(pool) => pool.install(run),
-            Err(_) => run(),
-        };
-        for r in results {
-            let (z, px) = r?;
-            out[z * slice_len..(z + 1) * slice_len].copy_from_slice(&px);
-        }
-        Ok::<_, DicomLoadError>(out)
-    })
+                        res
+                    })
+                    .collect::<Result<Vec<Option<(SliceHeader, Vec<i16>)>>, DicomLoadError>>()
+                    .map(|v| v.into_iter().flatten().collect())
+            };
+            let slices: Vec<(SliceHeader, Vec<i16>)> = match rayon::ThreadPoolBuilder::new()
+                .num_threads(READ_CONCURRENCY)
+                .build()
+            {
+                Ok(pool) => pool.install(run),
+                Err(_) => run(),
+            }?;
+
+            if slices.is_empty() {
+                return Err(DicomLoadError::NoDicoms {
+                    scanned: total_files,
+                    skipped: total_files,
+                });
+            }
+
+            // Reuse scan's grouping + z-ordering on the headers we just read, so
+            // the reconstructed volume is byte-identical to the scan-then-decode
+            // path. Pixels are looked up by path in the descriptor's z-order.
+            let mut pixels_by_path: HashMap<PathBuf, Vec<i16>> =
+                HashMap::with_capacity(slices.len());
+            let mut headers: Vec<SliceHeader> = Vec::with_capacity(slices.len());
+            for (h, px) in slices {
+                pixels_by_path.insert(h.path.clone(), px);
+                headers.push(h);
+            }
+
+            let desc = descriptors_from_headers(headers)
+                .into_iter()
+                .find(|d| d.uid == uid_owned)
+                .ok_or(DicomLoadError::SeriesNotFound { uid: uid_owned })?;
+
+            let slice_len = (desc.rows as usize) * (desc.cols as usize);
+            let total_voxels = slice_len * desc.num_slices;
+            let total_bytes_mb = (total_voxels * 2) / (1024 * 1024);
+            check_volume_size_mb(total_bytes_mb)?;
+
+            let mut out = vec![0i16; total_voxels];
+            for (z, p) in desc.file_paths.iter().enumerate() {
+                let px = pixels_by_path
+                    .remove(p)
+                    .ok_or_else(|| DicomLoadError::ParseFailed {
+                        path: p.clone(),
+                        reason: "slice pixels missing after single-pass decode".to_string(),
+                    })?;
+                if px.len() != slice_len {
+                    return Err(DicomLoadError::InconsistentDims {
+                        path: p.clone(),
+                        rows_got: (px.len() / (desc.cols.max(1) as usize)) as u32,
+                        cols_got: desc.cols,
+                        rows_want: desc.rows,
+                        cols_want: desc.cols,
+                    });
+                }
+                out[z * slice_len..(z + 1) * slice_len].copy_from_slice(&px);
+            }
+
+            Ok((VolumeMetadata::from(&desc), out))
+        },
+    )
     .await
     .map_err(|e| DicomLoadError::ParseFailed {
         path: dir_owned,
@@ -174,7 +214,7 @@ pub async fn load_series(
     })??;
 
     Ok(LoadedVolume {
-        metadata: VolumeMetadata::from(&desc),
+        metadata,
         voxels_i16: voxels,
     })
 }

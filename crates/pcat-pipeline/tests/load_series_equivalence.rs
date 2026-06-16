@@ -27,13 +27,23 @@ async fn load_series_reference_checksum() {
     let mid = vol.voxels_i16[len / 2];
     let last = *vol.voxels_i16.last().unwrap();
     eprintln!(
-        "REFVALUES num_slices={} rows={} cols={} len={} sum={} first={} mid={} last={} z0={} zlast={} spacing={}",
+        "VALUES num_slices={} rows={} cols={} len={} sum={} first={} mid={} last={} z0={} zlast={} spacing={}",
         m.num_slices, m.rows, m.cols, len, sum, first, mid, last,
         m.slice_positions_z[0], m.slice_positions_z.last().unwrap(), m.slice_spacing
     );
 
-    // ---- Equivalence asserts (filled in after capturing the reference run) ----
-    // assert_eq!(m.num_slices, REF_NUM_SLICES);
-    // assert_eq!(sum, REF_SUM);
-    // ...
+    // Reference captured from the scan-then-decode implementation on this series.
+    // The single-pass loader MUST reproduce these exactly (byte-identical volume,
+    // identical z-ordering) — the integer checksums are the strong guarantee.
+    assert_eq!(m.num_slices, 339, "num_slices");
+    assert_eq!(m.rows, 512, "rows");
+    assert_eq!(m.cols, 513, "cols");
+    assert_eq!(len, 89_040_384, "voxel count");
+    assert_eq!(sum, -22_095_243_454, "voxel checksum (sum)");
+    assert_eq!(first, -913, "first voxel");
+    assert_eq!(mid, -488, "mid voxel");
+    assert_eq!(last, -92, "last voxel");
+    assert!((m.slice_positions_z[0] - 1487.9196).abs() < 1e-3, "z0");
+    assert!((m.slice_positions_z.last().unwrap() - 1607.0804).abs() < 1e-3, "zlast");
+    assert!((m.slice_spacing - 0.3525).abs() < 1e-3, "spacing");
 }
