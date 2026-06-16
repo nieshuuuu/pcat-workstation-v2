@@ -1297,6 +1297,14 @@ pub async fn set_active_volume_meta(
     Ok(metadata)
 }
 
+/// TEMP DEV INSTRUMENTATION — prints a frontend message to the dev terminal
+/// (captured in /tmp/pcat_dev.log) so we can read exact JS errors + stacks
+/// without the webview devtools. Remove before release.
+#[tauri::command]
+pub fn dev_report(msg: String) {
+    eprintln!("[DEV-REPRO] {msg}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

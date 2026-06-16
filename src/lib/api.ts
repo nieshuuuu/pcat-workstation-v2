@@ -14,6 +14,11 @@ export async function getRecentDicoms(): Promise<string[]> {
   return invoke<string[]>('get_recent_dicoms');
 }
 
+/** TEMP DEV — echo a message to the dev terminal log. Remove before release. */
+export async function devReport(msg: string): Promise<void> {
+  return invoke<void>('dev_report', { msg });
+}
+
 /** Save seeds JSON to app data directory, keyed by DICOM path. Returns the file path. */
 export async function saveSeeds(seedsJson: string, dicomPath: string): Promise<string> {
   return invoke<string>('save_seeds', { seedsJson, dicomPath });
