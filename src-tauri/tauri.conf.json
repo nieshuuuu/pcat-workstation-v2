@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicegram/nicegram-spec/refs/heads/main/tauri-conf.schema.json",
   "productName": "PCAT Workstation",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "identifier": "com.pcat.workstation",
   "build": {
     "frontendDist": "../dist",
