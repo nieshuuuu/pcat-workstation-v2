@@ -145,9 +145,11 @@ pub struct PatientInfo {
     pub path: String,
     /// `not_started` | `in_progress` | `complete`.
     pub status: String,
-    /// Number of cross-sections marked finalized in saved annotations (0 if none).
+    /// Always 0. The annotations-based finalized-contour count is no longer
+    /// derived; this field is kept only for API stability.
     pub finalized_count: usize,
-    /// Whether MMD has been run and stored in saved annotations.
+    /// Whether MMD has been run, derived from the saved session bundle
+    /// (`sessions/{key}.json`): true when `mmd.summary` is non-null.
     pub has_mmd: bool,
 }
 
@@ -264,8 +266,10 @@ fn patient_session_summary(app: &tauri::AppHandle, patient_path: &str) -> (bool,
 
 /// Walk `root_dir` and return a sorted list of patient folders with status badges.
 ///
-/// Status: `complete` if MMD has been run AND ≥1 contour finalized,
-/// `in_progress` if any annotation file exists, `not_started` otherwise.
+/// Status is derived from the per-series session bundle (`sessions/{key}.json`):
+/// - `complete`     — any session has BOTH FAI results AND an MMD summary in the same bundle.
+/// - `in_progress`  — the patient has seeds saved (but no complete session yet).
+/// - `not_started`  — neither condition holds.
 #[tauri::command]
 pub async fn list_patients(
     app: tauri::AppHandle,
@@ -294,11 +298,11 @@ pub async fn list_patients(
     .await
     .map_err(|e| format!("walk task failed: {e}"))??;
 
-    // Cross-reference annotation + seeds saves on the main task (cheap local
-    // FS reads). Status rules, in priority order:
-    //   complete    — MMD has been run (mmd_method present in saved JSON)
-    //   in_progress — any activity: seeds saved, contours saved, or both
-    //   not_started — nothing on disk for this patient yet
+    // Derive status from session bundles + seeds (cheap local FS reads).
+    // Session bundles live at sessions/{key}.json, one per series. Status rules:
+    //   complete    — any session bundle has BOTH FAI results and MMD summary
+    //   in_progress — seeds exist for this patient (no complete session yet)
+    //   not_started — nothing on disk for this patient
     let mut patients = Vec::with_capacity(entries.len());
     for (id, path) in entries {
         let path_str = path.to_string_lossy().to_string();
