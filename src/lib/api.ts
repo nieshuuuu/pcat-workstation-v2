@@ -545,10 +545,6 @@ export type PatientInfo = {
   /** Absolute path to the patient's DICOM folder. */
   path: string;
   status: PatientStatus;
-  /** Number of cross-sections marked finalized in saved annotations. */
-  finalized_count: number;
-  /** Whether MMD has been run and stored in saved annotations. */
-  has_mmd: boolean;
   /** Whether the patient's data is flagged as problematic / unusable. */
   flagged: boolean;
   /** Optional note explaining the flag (null when not flagged). */

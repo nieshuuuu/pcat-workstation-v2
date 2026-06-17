@@ -288,11 +288,6 @@
                 </button>
               {/if}
               <div class="flex shrink-0 items-center gap-3">
-                {#if p.finalized_count > 0}
-                  <span class="text-[10px] tabular-nums text-text-secondary">
-                    {p.finalized_count} contour{p.finalized_count === 1 ? '' : 's'}{p.has_mmd ? ' · MMD' : ''}
-                  </span>
-                {/if}
                 {#if p.flagged}
                   <span
                     class="rounded bg-error/15 px-1.5 py-0.5 text-[10px] font-medium text-error"

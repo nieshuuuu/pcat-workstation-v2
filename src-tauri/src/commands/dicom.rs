@@ -146,12 +146,6 @@ pub struct PatientInfo {
     pub path: String,
     /// `not_started` | `in_progress` | `complete`.
     pub status: String,
-    /// Always 0. The annotations-based finalized-contour count is no longer
-    /// derived; this field is kept only for API stability.
-    pub finalized_count: usize,
-    /// Whether MMD has been run, derived from the saved session bundle
-    /// (`sessions/{key}.json`): true when `mmd.summary` is non-null.
-    pub has_mmd: bool,
     /// Whether the patient's data has been flagged as problematic / unusable.
     pub flagged: bool,
     /// Optional note explaining the flag (None when not flagged).
@@ -234,9 +228,9 @@ fn status_for(complete: bool, has_seeds: bool) -> &'static str {
 /// Scan saved session bundles for this patient. Sessions are keyed per *series*
 /// (`patient_file_key` of a series subfolder) and a patient folder holds several
 /// series, so we substring-match the sanitized patient path exactly like
-/// `patient_has_seeds`. Returns (complete, has_mmd): `complete` iff ANY single
-/// session has both FAI and MMD (that series is fully analyzed).
-fn patient_session_summary(app: &tauri::AppHandle, patient_path: &str) -> (bool, bool) {
+/// `patient_has_seeds`. Returns whether ANY single session is `complete` — i.e.
+/// has both FAI and MMD (that series is fully analyzed).
+fn patient_session_summary(app: &tauri::AppHandle, patient_path: &str) -> bool {
     let dir = app
         .path()
         .app_data_dir()
@@ -244,13 +238,12 @@ fn patient_session_summary(app: &tauri::AppHandle, patient_path: &str) -> (bool,
         .join("sessions");
     let needle = sanitize_for_filename(patient_path);
     if needle.is_empty() {
-        return (false, false);
+        return false;
     }
     let Ok(read) = std::fs::read_dir(&dir) else {
-        return (false, false);
+        return false;
     };
     let mut complete = false;
-    let mut has_mmd = false;
     for entry in read.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.contains(&needle) {
@@ -264,9 +257,8 @@ fn patient_session_summary(app: &tauri::AppHandle, patient_path: &str) -> (bool,
         };
         let (f, m) = session_flags(&json);
         complete |= f && m;
-        has_mmd |= m;
     }
-    (complete, has_mmd)
+    complete
 }
 
 /// Walk `root_dir` and return a sorted list of patient folders with status badges.
@@ -317,7 +309,7 @@ pub async fn list_patients(
     for (id, path) in entries {
         let path_str = path.to_string_lossy().to_string();
         let has_seeds = patient_has_seeds(&app, &path_str);
-        let (complete, has_mmd) = patient_session_summary(&app, &path_str);
+        let complete = patient_session_summary(&app, &path_str);
         let status = status_for(complete, has_seeds);
         let flag = read_flag_at(&flag_file_path(&flags_base, &path_str))
             .ok()
@@ -326,11 +318,6 @@ pub async fn list_patients(
             id,
             path: path_str,
             status: status.to_string(),
-            // Finalized contour count is not persisted in the session bundle;
-            // the old annotations-based count was already always 0. Kept for API
-            // stability.
-            finalized_count: 0,
-            has_mmd,
             flagged: flag.as_ref().map(|f| f.flagged).unwrap_or(false),
             flag_note: flag.and_then(|f| if f.note.is_empty() { None } else { Some(f.note) }),
         });
