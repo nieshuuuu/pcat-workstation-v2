@@ -191,29 +191,75 @@ fn patient_has_seeds(app: &tauri::AppHandle, patient_path: &str) -> bool {
     false
 }
 
-/// Reads saved annotation JSON for a given patient folder name and returns
-/// (finalized_count, has_mmd). Returns (0, false) if no save exists.
-fn read_annotation_summary(app: &tauri::AppHandle, folder_name: &str) -> (usize, bool) {
-    let dir = app.path().app_data_dir().expect("app data dir").join("annotations");
-    // Filename is `sanitize(folder_name).json` — match the convention in
-    // `save_annotations` / `load_annotations`.
-    let file = dir.join(format!("{}.json", sanitize_for_filename(folder_name)));
-    let Ok(data) = std::fs::read_to_string(&file) else {
-        return (0, false);
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
-        return (0, false);
-    };
-    let finalized_count = json
-        .get("finalized")
+/// Whether a parsed session bundle contains FAI results and an MMD summary.
+/// Contract with src/lib/session.ts `saveSession`: the bundle has
+/// `fai: object|null` (a non-empty object means FAI ran) and
+/// `mmd: { summary: any|null }` (non-null summary means MMD ran). These three
+/// field names are the contract between session.ts and this reader; the tests
+/// above pin it.
+fn session_flags(bundle: &serde_json::Value) -> (bool, bool) {
+    let has_fai = bundle
+        .get("fai")
         .and_then(|v| v.as_object())
-        .map(|m| m.values().filter(|v| v.as_bool().unwrap_or(false)).count())
-        .unwrap_or(0);
-    let has_mmd = json
-        .get("mmd_method")
-        .map(|v| !v.is_null())
+        .map(|o| !o.is_empty())
         .unwrap_or(false);
-    (finalized_count, has_mmd)
+    let has_mmd = bundle
+        .get("mmd")
+        .and_then(|m| m.get("summary"))
+        .map(|s| !s.is_null())
+        .unwrap_or(false);
+    (has_fai, has_mmd)
+}
+
+/// Derived patient status label. Mirrored (kept trivially simple) in
+/// src/lib/patientStatus.ts `derivePatientStatus` for the live footer; this Rust
+/// version is the canonical, tested one driving the patient-list badges.
+fn status_for(complete: bool, has_seeds: bool) -> &'static str {
+    if complete {
+        "complete"
+    } else if has_seeds {
+        "in_progress"
+    } else {
+        "not_started"
+    }
+}
+
+/// Scan saved session bundles for this patient. Sessions are keyed per *series*
+/// (`patient_file_key` of a series subfolder) and a patient folder holds several
+/// series, so we substring-match the sanitized patient path exactly like
+/// `patient_has_seeds`. Returns (complete, has_mmd): `complete` iff ANY single
+/// session has both FAI and MMD (that series is fully analyzed).
+fn patient_session_summary(app: &tauri::AppHandle, patient_path: &str) -> (bool, bool) {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .expect("app data dir")
+        .join("sessions");
+    let needle = sanitize_for_filename(patient_path);
+    if needle.is_empty() {
+        return (false, false);
+    }
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        return (false, false);
+    };
+    let mut complete = false;
+    let mut has_mmd = false;
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.contains(&needle) {
+            continue;
+        }
+        let Ok(data) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        let (f, m) = session_flags(&json);
+        complete |= f && m;
+        has_mmd |= m;
+    }
+    (complete, has_mmd)
 }
 
 /// Walk `root_dir` and return a sorted list of patient folders with status badges.
@@ -256,20 +302,17 @@ pub async fn list_patients(
     let mut patients = Vec::with_capacity(entries.len());
     for (id, path) in entries {
         let path_str = path.to_string_lossy().to_string();
-        let (finalized_count, has_mmd) = read_annotation_summary(&app, &id);
         let has_seeds = patient_has_seeds(&app, &path_str);
-        let status = if has_mmd {
-            "complete"
-        } else if has_seeds || finalized_count > 0 {
-            "in_progress"
-        } else {
-            "not_started"
-        };
+        let (complete, has_mmd) = patient_session_summary(&app, &path_str);
+        let status = status_for(complete, has_seeds);
         patients.push(PatientInfo {
             id,
             path: path_str,
             status: status.to_string(),
-            finalized_count,
+            // Finalized contour count is not persisted in the session bundle;
+            // the old annotations-based count was already always 0. Kept for API
+            // stability.
+            finalized_count: 0,
             has_mmd,
         });
     }
@@ -1333,6 +1376,44 @@ mod tests {
         let b = patient_file_key("/data/510829769/MonoPlus_70keV");
         assert_ne!(a, b, "different patients sharing a series name must not collide");
         assert!(a.ends_with(".json") && b.ends_with(".json"));
+    }
+
+    #[test]
+    fn session_flags_complete_bundle() {
+        // Mirrors src/lib/session.ts saveSession bundle shape.
+        let bundle: serde_json::Value = serde_json::from_str(
+            r#"{ "version":1, "savedAt":"t",
+                 "seeds":{"activeVessel":"RCA","vessels":{}},
+                 "fai":{"RCA":{"fai_mean_hu":-75.0}},
+                 "mmd":{"summary":{"n":3},"surfaces":[]},
+                 "wl":null }"#,
+        )
+        .unwrap();
+        assert_eq!(session_flags(&bundle), (true, true));
+    }
+
+    #[test]
+    fn session_flags_fai_only_is_not_complete() {
+        let bundle: serde_json::Value =
+            serde_json::from_str(r#"{"fai":{"RCA":{}},"mmd":{"summary":null}}"#).unwrap();
+        assert_eq!(session_flags(&bundle), (true, false));
+    }
+
+    #[test]
+    fn session_flags_empty_bundle() {
+        let bundle: serde_json::Value =
+            serde_json::from_str(r#"{"fai":null,"mmd":{"summary":null}}"#).unwrap();
+        assert_eq!(session_flags(&bundle), (false, false));
+    }
+
+    #[test]
+    fn status_for_rules() {
+        // (complete, has_seeds) -> label. This is the bug regression: a bundle
+        // with FAI+MMD must yield "complete".
+        assert_eq!(status_for(true, true), "complete");
+        assert_eq!(status_for(true, false), "complete");
+        assert_eq!(status_for(false, true), "in_progress");
+        assert_eq!(status_for(false, false), "not_started");
     }
 
     /// Minimal single-column volume: `z_positions.len()` slices, in-plane
