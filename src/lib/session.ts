@@ -21,6 +21,18 @@ const SESSION_VERSION = 1;
 
 export type SessionMeta = { savedAt: string };
 
+/** Reset ALL per-patient analysis state to a clean slate. Call this on every
+ *  new load BEFORE restoring, so one patient's seeds / FAI / MMD / water-lipid
+ *  never linger into the next patient when the next has nothing saved to
+ *  overwrite them. (loadSession only restores what a session contains; absent
+ *  pieces must already be cleared.) */
+export function clearSession() {
+  seedStore.clearAll();
+  pipelineStore.reset();
+  mmdStore.clear();
+  wlStore.reset();
+}
+
 /** Persist seeds + FAI + water/lipid quantification for this patient. */
 export async function saveSession(dicomPath: string): Promise<void> {
   if (!dicomPath) throw new Error('no patient loaded');

@@ -29,14 +29,13 @@
     reuseLoadedVolume,
   } from '$lib/api';
   import type { LoadedSeriesDescriptor } from '$lib/api';
-  import { loadSession } from '$lib/session';
+  import { loadSession, clearSession } from '$lib/session';
   import { cache as cornerstoneCache } from '@cornerstonejs/core';
   import { buildVolume } from '$lib/cornerstone/volumeLoader';
   import { volumeStore } from '$lib/stores/volumeStore.svelte';
   import type { VolumeMetadata } from '$lib/stores/volumeStore.svelte';
   import { pipelineStore } from '$lib/stores/pipelineStore.svelte';
   import { seedStore, type Vessel } from '$lib/stores/seedStore.svelte';
-  import { wlStore } from '$lib/stores/wlStore.svelte';
   import { uiStore } from '$lib/stores/uiStore.svelte';
   import { navigateToWorldPos } from '$lib/navigation';
 
@@ -61,9 +60,9 @@
    *  patient on open. Falls back to legacy seeds-only saves so patients saved
    *  before the unified session still restore their seeds. */
   async function autoRestoreSession(dicomPath: string) {
-    // Clear any prior patient's water/lipid maps up front; loadSession restores
-    // this patient's calibration if the saved session has one.
-    wlStore.reset();
+    // Clean slate per patient — never carry one patient's seeds / FAI / MMD /
+    // water-lipid into the next. loadSession restores this patient's saved state.
+    clearSession();
     try {
       const meta = await loadSession(dicomPath);
       if (!meta) {
