@@ -38,6 +38,9 @@
   import { seedStore, type Vessel } from '$lib/stores/seedStore.svelte';
   import { uiStore } from '$lib/stores/uiStore.svelte';
   import { navigateToWorldPos } from '$lib/navigation';
+  import { mmdStore } from '$lib/stores/mmdStore.svelte';
+  import { flagStore } from '$lib/stores/flagStore.svelte';
+  import { derivePatientStatus, patientIdOf } from '$lib/patientStatus';
 
   /* ── Tab state ─────────────────────────────────────── */
   type AppTab = 'editor' | 'mmd' | 'wl';
@@ -47,6 +50,8 @@
   let activeCenterlineMm = $derived(seedStore.activeVesselData.centerline ?? []);
 
   let errorMessage = $state('');
+  let showFlagDialog = $state(false);
+  let flagNoteDraft = $state('');
   let recentPaths = $state<string[]>([]);
   let showRecent = $state(false);
   let showPatientBrowser = $state(false);
@@ -70,6 +75,7 @@
         if (seedsJson) seedStore.importJson(seedsJson);
       }
     } catch { /* no saved session/seeds for this patient */ }
+    await flagStore.load(dicomPath);
   }
 
   /** Run FAI, then auto-persist the session so the patient list shows progress
@@ -773,6 +779,63 @@
     />
   {/if}
 
+  <!-- ===== Flag dialog ===== -->
+  {#if showFlagDialog}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+      class="absolute inset-0 z-50 flex items-center justify-center bg-black/40"
+      onclick={(e) => { if (e.target === e.currentTarget) showFlagDialog = false; }}
+    >
+      <div class="w-80 rounded-lg border border-border bg-surface-secondary p-4 shadow-xl">
+        <h3 class="mb-1 text-sm font-semibold text-text-primary">Flag this data</h3>
+        <p class="mb-2 text-[11px] text-text-secondary">
+          Mark this patient's data as problematic / unusable — e.g. vessel
+          discontinuity, motion or recon artifact.
+        </p>
+        <textarea
+          bind:value={flagNoteDraft}
+          rows="3"
+          placeholder="Optional note (what's wrong)…"
+          class="w-full rounded border border-border bg-surface px-2 py-1 text-xs text-text-primary focus:border-accent focus:outline-none"
+        ></textarea>
+        <div class="mt-3 flex items-center justify-between gap-2">
+          {#if flagStore.current?.flagged}
+            <button
+              class="rounded px-2 py-1 text-[11px] text-text-secondary hover:bg-surface-tertiary"
+              onclick={async () => {
+                if (volumeStore.dicomPath) await flagStore.set(volumeStore.dicomPath, false, '');
+                showFlagDialog = false;
+              }}
+            >
+              Remove flag
+            </button>
+          {:else}
+            <span></span>
+          {/if}
+          <div class="flex gap-2">
+            <button
+              class="rounded px-2 py-1 text-[11px] text-text-secondary hover:bg-surface-tertiary"
+              onclick={() => (showFlagDialog = false)}
+            >
+              Cancel
+            </button>
+            <button
+              class="rounded bg-error/15 px-3 py-1 text-[11px] font-medium text-error hover:bg-error/25"
+              onclick={async () => {
+                if (volumeStore.dicomPath)
+                  await flagStore.set(volumeStore.dicomPath, true, flagNoteDraft.trim());
+                showFlagDialog = false;
+              }}
+            >
+              Flag
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   <!-- ===== Footer status bar ===== -->
   <footer
     class="flex h-6 shrink-0 items-center justify-between border-t border-border bg-surface-secondary px-4"
@@ -798,8 +861,42 @@
         <span class="h-1.5 w-1.5 rounded-full bg-error"></span>
         <span class="truncate text-[11px] text-error">{errorMessage}</span>
       {:else if volumeStore.current}
-        <span class="h-1.5 w-1.5 rounded-full bg-success"></span>
-        <span class="text-[11px] text-text-secondary">Volume loaded</span>
+        {@const st = derivePatientStatus({
+          hasSeeds: (['LAD', 'LCx', 'RCA'] as const).some(
+            (v) => seedStore.vessels[v].seeds.length > 0,
+          ),
+          hasFai: pipelineStore.results !== null,
+          hasMmd: mmdStore.summary !== null,
+        })}
+        <span class="h-1.5 w-1.5 rounded-full {st === 'complete' ? 'bg-success' : 'bg-warning'}"></span>
+        <span class="text-[11px] font-medium text-text-primary">{patientIdOf(volumeStore.dicomPath)}</span>
+        {#if volumeStore.current.studyDescription}
+          <span class="truncate text-[11px] text-text-secondary">· {volumeStore.current.studyDescription}</span>
+        {/if}
+        <span
+          class="rounded px-1.5 text-[10px] font-medium {st === 'complete'
+            ? 'bg-success/15 text-success'
+            : 'bg-warning/15 text-warning'}"
+        >
+          {st === 'complete' ? 'complete' : 'in progress'}
+        </span>
+        {#if flagStore.current?.flagged}
+          <button
+            class="rounded bg-error/15 px-1.5 text-[10px] font-medium text-error hover:bg-error/25"
+            title={flagStore.current.note || 'Flagged: data problem / unusable'}
+            onclick={() => { flagNoteDraft = flagStore.current?.note ?? ''; showFlagDialog = true; }}
+          >
+            ⚠ Flagged
+          </button>
+        {:else}
+          <button
+            class="rounded px-1.5 text-[10px] text-text-secondary hover:bg-surface-tertiary hover:text-text-primary"
+            title="Flag this data as problematic / unusable"
+            onclick={() => { flagNoteDraft = ''; showFlagDialog = true; }}
+          >
+            ⚑ Flag
+          </button>
+        {/if}
       {:else}
         <span class="h-1.5 w-1.5 rounded-full bg-text-secondary/40"></span>
         <span class="text-[11px] text-text-secondary">Ready</span>
