@@ -11,6 +11,7 @@
    */
   import { MMD_MASS_MAX_MGML, type AnnotationTarget } from '$lib/api';
   import { jet, CT_LO, CT_HI } from '$lib/colormap';
+  import AngleMarkers from './AngleMarkers.svelte';
 
   type Props = {
     target: AnnotationTarget;
@@ -258,6 +259,9 @@
         onmousemove={handleMove}
         onmouseleave={() => (hover = null)}
       ></canvas>
+
+      <!-- Angular (θ) reference — faint, matches the MMD 3D surface plot's theta -->
+      <AngleMarkers />
 
       <!-- Hover readout: value ± σ for the selected material/unit (mirrors the
            Water/Lipid view's tooltip). -->

@@ -11,6 +11,7 @@
    * of truth for the measurement).
    */
   import { invoke } from '@tauri-apps/api/core';
+  import AngleMarkers from './AngleMarkers.svelte';
 
   type Props = {
     centerlineMm: [number, number, number][];
@@ -247,6 +248,9 @@
     height={pixels}
     style="image-rendering: pixelated;"
   ></canvas>
+
+  <!-- Angular (θ) reference — faint, matches the MMD 3D surface plot's theta -->
+  <AngleMarkers />
 
   <!-- Diameter measurement overlay -->
   {#if caliper && wallPolygonPoints && vesselDiameterMm !== null}
