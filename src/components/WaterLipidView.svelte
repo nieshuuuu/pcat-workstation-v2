@@ -27,6 +27,8 @@
   } from '$lib/api';
   import { wlStore } from '$lib/stores/wlStore.svelte';
   import { jet, CT_LO, CT_HI } from '$lib/colormap';
+  import { volumeStore } from '$lib/stores/volumeStore.svelte';
+  import { saveSession } from '$lib/session';
 
   type WlMap = 'fw' | 'fl' | 'sf';
 
@@ -117,6 +119,13 @@
       // makes the calibration part of the unified session save. z + slice fetch
       // are handled by the effects below (which also fire on session restore).
       wlStore.set(await runWaterLipid());
+      if (volumeStore.dicomPath) {
+        try {
+          await saveSession(volumeStore.dicomPath);
+        } catch (e) {
+          console.error('auto-save after water/lipid failed:', e);
+        }
+      }
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       wlStore.reset();

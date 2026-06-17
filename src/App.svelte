@@ -29,7 +29,7 @@
     reuseLoadedVolume,
   } from '$lib/api';
   import type { LoadedSeriesDescriptor } from '$lib/api';
-  import { loadSession, clearSession } from '$lib/session';
+  import { loadSession, clearSession, saveSession } from '$lib/session';
   import { cache as cornerstoneCache } from '@cornerstonejs/core';
   import { buildVolume } from '$lib/cornerstone/volumeLoader';
   import { volumeStore } from '$lib/stores/volumeStore.svelte';
@@ -70,6 +70,19 @@
         if (seedsJson) seedStore.importJson(seedsJson);
       }
     } catch { /* no saved session/seeds for this patient */ }
+  }
+
+  /** Run FAI, then auto-persist the session so the patient list shows progress
+   *  without a manual Save. Footer status updates live regardless. */
+  async function runFaiAndSave() {
+    await pipelineStore.run();
+    if (pipelineStore.status === 'complete' && volumeStore.dicomPath) {
+      try {
+        await saveSession(volumeStore.dicomPath);
+      } catch (e) {
+        console.error('auto-save after FAI failed:', e);
+      }
+    }
   }
 
   // Clear stale FAI/pipeline results (and their overlay) when the centerline is
@@ -604,7 +617,7 @@
       {#if pipelineStore.status === 'complete'}
         <button
           class="rounded bg-accent/10 px-3 py-1 text-xs font-medium text-accent hover:bg-accent/20"
-          onclick={() => { pipelineStore.run(); }}
+          onclick={() => { runFaiAndSave(); }}
           title="Re-run: centerline → contour extraction → CRISP-CT VOI (1mm gap + 3mm ring) → FAI stats"
         >
           Re-analyze
@@ -612,7 +625,7 @@
       {:else if pipelineStore.canRun}
         <button
           class="rounded px-3 py-1 text-xs font-medium text-accent hover:bg-accent/10 active:bg-accent/20 disabled:opacity-40"
-          onclick={() => pipelineStore.run()}
+          onclick={() => runFaiAndSave()}
           disabled={pipelineStore.status === 'running'}
           title="Run FAI pipeline: centerline → contour extraction → CRISP-CT VOI (1mm gap + 3mm ring) → FAI stats"
         >

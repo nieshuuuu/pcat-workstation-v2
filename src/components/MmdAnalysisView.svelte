@@ -379,6 +379,13 @@
     try {
       mmdStore.summary = await runMmdOnRoi('gls');
       await refreshSurfaces();
+      if (dicomPath) {
+        try {
+          await saveSession(dicomPath);
+        } catch (e) {
+          console.error('auto-save after MMD failed:', e);
+        }
+      }
     } catch (err) {
       mmdError = err instanceof Error ? err.message : String(err);
       console.error('MMD failed:', err);
