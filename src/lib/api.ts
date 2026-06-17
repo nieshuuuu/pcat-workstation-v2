@@ -509,6 +509,25 @@ export async function loadSession(dicomPath: string): Promise<string | null> {
   return invoke<string | null>('load_session', { dicomPath });
 }
 
+/** Patient-level data-quality flag ("Flagged" — data has a problem / unusable). */
+export type PatientFlag = { flagged: boolean; note: string; flagged_at: string };
+
+/** Read a patient's flag (the patient folder is derived backend-side from the
+ *  series `dicomPath`). Returns null if not flagged. */
+export async function getPatientFlag(dicomPath: string): Promise<PatientFlag | null> {
+  return invoke<PatientFlag | null>('get_patient_flag', { dicomPath });
+}
+
+/** Set or clear a patient's flag. `flagged=false` deletes the flag file. */
+export async function setPatientFlag(
+  dicomPath: string,
+  flagged: boolean,
+  note: string,
+  flaggedAt: string,
+): Promise<void> {
+  await invoke('set_patient_flag', { dicomPath, flagged, note, flaggedAt });
+}
+
 /** Export current MMD surface data as a CSV string. */
 export async function exportMmdCsv(
   patientId: string,
@@ -530,6 +549,10 @@ export type PatientInfo = {
   finalized_count: number;
   /** Whether MMD has been run and stored in saved annotations. */
   has_mmd: boolean;
+  /** Whether the patient's data is flagged as problematic / unusable. */
+  flagged: boolean;
+  /** Optional note explaining the flag (null when not flagged). */
+  flag_note: string | null;
 };
 
 /**
