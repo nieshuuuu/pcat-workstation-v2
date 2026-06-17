@@ -769,6 +769,7 @@
   <!-- ===== Patient browser modal ===== -->
   {#if showPatientBrowser}
     <PatientBrowser
+      currentPath={volumeStore.dicomPath}
       onSelect={(path) => { showPatientBrowser = false; loadFromPath(path); }}
       onSelectDualEnergy={(lowDir, highDir) => {
         showPatientBrowser = false;

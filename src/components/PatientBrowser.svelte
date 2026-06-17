@@ -17,6 +17,8 @@
   type Props = {
     /** Initial root directory (the user can edit it before scanning). */
     initialRootDir?: string;
+    /** The currently-loaded series path, to highlight its patient. */
+    currentPath?: string | null;
     /** Called for a regular single-series pick. */
     onSelect: (path: string) => void;
     /** Called when the picked series is one half of a MonoPlus keV pair —
@@ -32,6 +34,7 @@
 
   let {
     initialRootDir = '/Volumes/Molloilab/Shu Nie/UCI NAEOTOM CCTA Data',
+    currentPath = null,
     onSelect,
     onSelectDualEnergy,
     onSelectPatient,
@@ -49,7 +52,7 @@
    * Default `all` so users see everything when they open the browser.
    */
   let query = $state('');
-  let statusFilter = $state<'all' | 'not_started' | 'in_progress' | 'complete'>('all');
+  let statusFilter = $state<'all' | 'not_started' | 'in_progress' | 'complete' | 'flagged'>('all');
 
   async function refresh() {
     if (loading) return;
@@ -73,7 +76,13 @@
   let filtered = $derived.by(() => {
     const q = query.trim().toLowerCase();
     return patients.filter((p) => {
-      if (statusFilter !== 'all' && p.status !== statusFilter) return false;
+      const statusOk =
+        statusFilter === 'all'
+          ? true
+          : statusFilter === 'flagged'
+            ? p.flagged
+            : p.status === statusFilter;
+      if (!statusOk) return false;
       if (q && !p.id.toLowerCase().includes(q)) return false;
       return true;
     });
@@ -86,7 +95,8 @@
       else if (p.status === 'in_progress') ip++;
       else if (p.status === 'complete') cp++;
     }
-    return { ns, ip, cp, total: patients.length };
+    const fl = patients.filter((p) => p.flagged).length;
+    return { ns, ip, cp, total: patients.length, fl };
   });
 
   function statusLabel(s: PatientInfo['status']): string {
@@ -225,6 +235,7 @@
         <option value="not_started">Not started ({counts.ns})</option>
         <option value="in_progress">In progress ({counts.ip})</option>
         <option value="complete">Done ({counts.cp})</option>
+        <option value="flagged">Flagged ({counts.fl})</option>
       </select>
     </div>
 
@@ -245,10 +256,13 @@
       {:else}
         {#each filtered as p (p.id)}
           {@const isOpen = !!expanded[p.id]}
+          {@const isLoaded = !!currentPath && currentPath.startsWith(p.path)}
           <div class="border-b border-border/60">
             <!-- Patient row: click expands to show series subfolders -->
             <div
-              class="flex w-full items-center justify-between gap-2 px-4 py-2 hover:bg-accent/5"
+              class="flex w-full items-center justify-between gap-2 px-4 py-2 hover:bg-accent/5 {isLoaded
+                ? 'border-l-2 border-accent bg-accent/10'
+                : ''}"
             >
               <button
                 class="flex min-w-0 flex-1 items-center gap-2 text-left"
@@ -277,6 +291,14 @@
                 {#if p.finalized_count > 0}
                   <span class="text-[10px] tabular-nums text-text-secondary">
                     {p.finalized_count} contour{p.finalized_count === 1 ? '' : 's'}{p.has_mmd ? ' · MMD' : ''}
+                  </span>
+                {/if}
+                {#if p.flagged}
+                  <span
+                    class="rounded bg-error/15 px-1.5 py-0.5 text-[10px] font-medium text-error"
+                    title={p.flag_note || 'Flagged: data problem / unusable'}
+                  >
+                    ⚠ Flagged
                   </span>
                 {/if}
                 <span
