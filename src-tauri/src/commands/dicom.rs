@@ -64,6 +64,17 @@ pub async fn get_recent_dicoms(app: tauri::AppHandle) -> Result<Vec<String>, Str
     Ok(load_recent_list(&app))
 }
 
+/// Panic-safe stderr line. Plain `eprintln!` calls `.expect("failed printing
+/// to stderr")` internally and ABORTS the whole process (SIGABRT) if the write
+/// fails — e.g. a broken output pipe, or a bundled `.app` launched with no
+/// connected console. We hit exactly that crash. This ignores the write error.
+macro_rules! log_line {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 /// Sanitize a path string into a safe filename component.
 fn sanitize_for_filename(s: &str) -> String {
     s.chars()
