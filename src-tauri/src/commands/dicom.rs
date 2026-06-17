@@ -1008,7 +1008,7 @@ pub async fn load_patient_all(
         });
         series_dirs.push(series_dir);
     }
-    eprintln!(
+    log_line!(
         "[load-timing] load_patient_all: scanned {} series (header-only) in {:.2?}",
         descriptors.len(),
         scan_started.elapsed()
@@ -1131,7 +1131,7 @@ pub async fn load_patient_all(
             );
         }
     }
-    eprintln!(
+    log_line!(
         "[load-timing] load_patient_all: decoded {} needed series (active + dual-energy pair) in {:.2?}",
         need.len(),
         decode_started.elapsed()
@@ -1208,7 +1208,7 @@ pub async fn load_patient_all(
                 let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
                 guard.dual_energy = Some(de);
                 if low_vol.metadata.num_slices != high_vol.metadata.num_slices {
-                    eprintln!(
+                    log_line!(
                         "[dual-energy] paired {} keV ({} slices) + {} keV ({} slices) on {} common z-positions",
                         low_kev, low_vol.metadata.num_slices, high_kev, high_vol.metadata.num_slices, n
                     );
