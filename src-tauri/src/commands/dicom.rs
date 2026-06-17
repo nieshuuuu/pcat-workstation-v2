@@ -12,6 +12,7 @@ use pcat_pipeline::types::LoadedVolume as StateLoadedVolume;
 use crate::state::AppState;
 use crate::volume_cache::CachedVolume;
 use crate::commands::framed::encode_frame;
+use crate::commands::flag::{flag_file_path, read_flag_at};
 
 const MAX_RECENT: usize = 10;
 
@@ -151,6 +152,10 @@ pub struct PatientInfo {
     /// Whether MMD has been run, derived from the saved session bundle
     /// (`sessions/{key}.json`): true when `mmd.summary` is non-null.
     pub has_mmd: bool,
+    /// Whether the patient's data has been flagged as problematic / unusable.
+    pub flagged: bool,
+    /// Optional note explaining the flag (None when not flagged).
+    pub flag_note: Option<String>,
 }
 
 /// Decide whether a directory looks like a patient folder.
@@ -303,12 +308,20 @@ pub async fn list_patients(
     //   complete    — any session bundle has BOTH FAI results and MMD summary
     //   in_progress — seeds exist for this patient (no complete session yet)
     //   not_started — nothing on disk for this patient
+    let flags_base = app
+        .path()
+        .app_data_dir()
+        .expect("app data dir")
+        .join("flags");
     let mut patients = Vec::with_capacity(entries.len());
     for (id, path) in entries {
         let path_str = path.to_string_lossy().to_string();
         let has_seeds = patient_has_seeds(&app, &path_str);
         let (complete, has_mmd) = patient_session_summary(&app, &path_str);
         let status = status_for(complete, has_seeds);
+        let flag = read_flag_at(&flag_file_path(&flags_base, &path_str))
+            .ok()
+            .flatten();
         patients.push(PatientInfo {
             id,
             path: path_str,
@@ -318,6 +331,8 @@ pub async fn list_patients(
             // stability.
             finalized_count: 0,
             has_mmd,
+            flagged: flag.as_ref().map(|f| f.flagged).unwrap_or(false),
+            flag_note: flag.and_then(|f| if f.note.is_empty() { None } else { Some(f.note) }),
         });
     }
 

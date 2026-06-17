@@ -53,6 +53,8 @@ pub fn run() {
             commands::water_lipid::run_water_lipid,
             commands::water_lipid::get_wl_slice,
             commands::water_lipid::restore_wl_calibration,
+            commands::flag::set_patient_flag,
+            commands::flag::get_patient_flag,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
