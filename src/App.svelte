@@ -869,7 +869,7 @@
           hasFai: pipelineStore.results !== null,
           hasMmd: mmdStore.summary !== null,
         })}
-        <span class="h-1.5 w-1.5 rounded-full {st === 'complete' ? 'bg-success' : 'bg-warning'}"></span>
+        <span class="h-1.5 w-1.5 rounded-full {st === 'complete' ? 'bg-success' : st === 'in_progress' ? 'bg-warning' : 'bg-text-secondary/40'}"></span>
         <span class="text-[11px] font-medium text-text-primary">{patientIdOf(volumeStore.dicomPath)}</span>
         {#if volumeStore.current.studyDescription}
           <span class="truncate text-[11px] text-text-secondary">· {volumeStore.current.studyDescription}</span>
@@ -877,9 +877,11 @@
         <span
           class="rounded px-1.5 text-[10px] font-medium {st === 'complete'
             ? 'bg-success/15 text-success'
-            : 'bg-warning/15 text-warning'}"
+            : st === 'in_progress'
+              ? 'bg-warning/15 text-warning'
+              : 'bg-text-secondary/15 text-text-secondary'}"
         >
-          {st === 'complete' ? 'complete' : 'in progress'}
+          {st === 'complete' ? 'complete' : st === 'in_progress' ? 'in progress' : 'not started'}
         </span>
         {#if flagStore.current?.flagged}
           <button

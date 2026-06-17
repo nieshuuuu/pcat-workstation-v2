@@ -33,8 +33,4 @@ export const flagStore = {
     await setPatientFlag(dicomPath, flagged, note, flaggedAt);
     current = flagged ? { flagged: true, note, flagged_at: flaggedAt } : null;
   },
-  /** Clear on patient switch. */
-  clear(): void {
-    current = null;
-  },
 };
