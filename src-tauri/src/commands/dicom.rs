@@ -237,39 +237,26 @@ fn patient_session_summary(app: &tauri::AppHandle, patient_path: &str) -> bool {
         .expect("app data dir")
         .join("sessions");
     let needle = sanitize_for_filename(patient_path);
-    let dbg = needle.contains("512339528");
     if needle.is_empty() {
         return false;
     }
-    let read = match std::fs::read_dir(&dir) {
-        Ok(r) => r,
-        Err(e) => { if dbg { let _ = std::fs::write("/tmp/pcat_dbg.txt", format!("dir={dir:?}\nread_dir ERR: {e}\n")); } return false; }
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        return false;
     };
     let mut complete = false;
-    let mut log = format!("dir={dir:?}\nneedle={needle}\n");
-    let (mut n_entries, mut n_match) = (0u32, 0u32);
     for entry in read.flatten() {
-        n_entries += 1;
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.contains(&needle) {
             continue;
         }
-        n_match += 1;
         let Ok(data) = std::fs::read_to_string(entry.path()) else {
-            log.push_str(&format!("READ FAIL {name}\n"));
             continue;
         };
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
-            log.push_str(&format!("PARSE FAIL {name}\n"));
             continue;
         };
         let (f, m) = session_flags(&json);
-        log.push_str(&format!("MATCH {name} f={f} m={m}\n"));
         complete |= f && m;
-    }
-    if dbg {
-        log.push_str(&format!("n_entries={n_entries} n_match={n_match} complete={complete}\n"));
-        let _ = std::fs::write("/tmp/pcat_dbg.txt", &log);
     }
     complete
 }
