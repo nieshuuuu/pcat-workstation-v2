@@ -237,6 +237,33 @@ fn patient_session_summary(app: &tauri::AppHandle, patient_path: &str) -> bool {
         .expect("app data dir")
         .join("sessions");
     let needle = sanitize_for_filename(patient_path);
+    if patient_path.contains("512339528") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mut log = format!("patient_path={patient_path}\nneedle={needle}\nsessions_dir={dir:?}\n");
+        match std::fs::read_dir(&dir) {
+            Ok(rd) => {
+                for e in rd.flatten() {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    if n.contains(&needle) {
+                        let fl = std::fs::read_to_string(e.path()).ok()
+                            .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
+                            .map(|j| session_flags(&j));
+                        log.push_str(&format!("SESS_MATCH {n} flags={fl:?}\n"));
+                    }
+                }
+            }
+            Err(err) => log.push_str(&format!("sessions read_dir ERR: {err}\n")),
+        }
+        if let Some(sd) = dir.parent().map(|p| p.join("seeds")) {
+            if let Ok(rd) = std::fs::read_dir(&sd) {
+                for e in rd.flatten() {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    if n.contains(&needle) { log.push_str(&format!("SEED_MATCH {n}\n")); }
+                }
+            }
+        }
+        let _ = std::fs::write(format!("{home}/pcat_diag2.txt"), log);
+    }
     if needle.is_empty() {
         return false;
     }
