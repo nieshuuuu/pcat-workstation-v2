@@ -6,7 +6,7 @@
    * badges derived from each patient's saved annotation JSON. Click a patient
    * to load it (caller wires in the load handler).
    */
-  import { untrack } from 'svelte';
+  import { untrack, onMount } from 'svelte';
   import {
     listPatients,
     listSeriesDirs,
@@ -68,8 +68,12 @@
     }
   }
 
-  // Auto-load on mount.
-  $effect(() => {
+  // Auto-load once on mount. NOT `$effect`: refresh() reads and writes the
+  // `loading` flag, which an $effect tracks as a dependency — so toggling
+  // loading re-fires the effect, re-running refresh() in an infinite re-scan
+  // loop (perpetual "Scanning…"). onMount runs it exactly once; the path-field
+  // Enter handler and the refresh button drive re-scans explicitly.
+  onMount(() => {
     refresh();
   });
 
