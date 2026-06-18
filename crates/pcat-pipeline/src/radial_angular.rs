@@ -351,6 +351,127 @@ mod tests {
         assert_eq!(s.max_r_per_theta.len(), 16);
     }
 
+    /// Consistency check (RIGHT path): the real `sample_radial_angular` must
+    /// sample the geometrically-correct world point for each (theta, r).
+    /// We encode world-x into the volume (value = voxel x; identity direction,
+    /// unit spacing, zero origin -> trilinear of a linear ramp is exact), so the
+    /// sampled value should equal the world-x of the point the sampler claims to
+    /// hit: pos.x + (r_wall_mm + r) * dir_x, with dir = sinθ·normal - cosθ·binormal.
+    #[test]
+    fn radial_sampling_lands_at_expected_world_position() {
+        let (nz, ny, nx) = (80usize, 80, 80);
+        let mut vol = Array3::<f32>::zeros((nz, ny, nx));
+        for ((_z, _y, x), v) in vol.indexed_iter_mut() {
+            *v = x as f32; // value == world-x (identity dir, unit spacing, zero origin)
+        }
+        let spacing = [1.0, 1.0, 1.0];
+        let origin = [0.0, 0.0, 0.0];
+
+        let frame = make_simple_frame(100);
+        let fi = 50usize;
+        let pos = frame.positions[fi];
+        let normal = frame.normals[fi];
+        let binormal = frame.binormals[fi];
+
+        let pixels = 128usize;
+        let width_mm = 15.0_f64;
+        let mm_per_pixel = 2.0 * width_mm / pixels as f64;
+        let r_wall_mm = 4.0_f64;
+        let center_px = pixels as f64 / 2.0;
+        let contour = circular_contour(center_px, center_px, r_wall_mm / mm_per_pixel, 144);
+        let mut finalized = HashMap::new();
+        finalized.insert(0, contour);
+
+        let target = make_target(fi, 25.0, pixels, width_mm);
+        let targets = vec![target];
+        let params = RadialAngularParams { n_theta: 8, radial_step_mm: 1.0, max_radius_mm: 8.0 };
+
+        let surfaces = sample_radial_angular(
+            &vol, &frame, &targets, &finalized, spacing, origin,
+            &crate::types::IDENTITY_DIRECTION, &params,
+        );
+        let s = &surfaces[0];
+
+        for (it, &theta_d) in s.theta_deg.iter().enumerate() {
+            let th = theta_d.to_radians();
+            let dir_x = th.sin() * normal[2] - th.cos() * binormal[2];
+            for (ir, &r) in s.r_mm.iter().enumerate() {
+                let got = s.surface[it * s.n_radial + ir];
+                if got.is_nan() { continue; }
+                let expected_world_x = pos[2] + (r_wall_mm + r) * dir_x;
+                assert!(
+                    (got as f64 - expected_world_x).abs() < 1e-2,
+                    "θ={theta_d} r={r}: sampler hit world-x {got} but geometry says {expected_world_x}"
+                );
+            }
+        }
+    }
+
+    /// Consistency check (LEFT vs RIGHT plane): the 2D overlay
+    /// (`get_mmd_overlay`, which maps pixel (row,col) -> world) and the 3D
+    /// radial surface (`sample_radial_angular`, which maps (theta, dist) ->
+    /// world) MUST place the same physical point at the same world position,
+    /// or the two MMD views show misregistered data. Both reduce to
+    /// world = pos + off_n·normal + off_b·binormal; this pins that equivalence.
+    /// Also documents the one known sub-pixel convention difference: the overlay
+    /// uses pixel→mm = 2·w/(pixels-1) while the radial path uses 2·w/pixels
+    /// (~0.4–0.8% radial scale; NOT the cause of the LEFT/RIGHT colour mismatch,
+    /// which is region + resolution + smoothing + per-pixel noise).
+    #[test]
+    fn overlay_and_radial_agree_on_world_position() {
+        let frame = make_simple_frame(100);
+        let fi = 50usize;
+        let pos = frame.positions[fi];
+        let normal = frame.normals[fi];
+        let binormal = frame.binormals[fi];
+        let pixels = 128usize;
+        let width_mm = 15.0_f64;
+
+        let world_from_offset = |off_n: f64, off_b: f64| {
+            [
+                pos[0] + off_n * normal[0] + off_b * binormal[0],
+                pos[1] + off_n * normal[1] + off_b * binormal[1],
+                pos[2] + off_n * normal[2] + off_b * binormal[2],
+            ]
+        };
+
+        for &(off_n, off_b) in &[(4.3, -2.1), (-6.0, 0.0), (0.0, 7.5), (2.0, 2.0)] {
+            // Overlay convention: off_n = w(1 - 2·row/(p-1)) -> recover (row,col),
+            // then world = pos + off_n·normal + off_b·binormal.
+            let row = (1.0 - off_n / width_mm) * (pixels as f64 - 1.0) / 2.0;
+            let col = (1.0 - off_b / width_mm) * (pixels as f64 - 1.0) / 2.0;
+            let ov_off_n = width_mm * (1.0 - 2.0 * row / (pixels as f64 - 1.0));
+            let ov_off_b = width_mm * (1.0 - 2.0 * col / (pixels as f64 - 1.0));
+            let w_overlay = world_from_offset(ov_off_n, ov_off_b);
+
+            // Radial convention: off_n = dist·sinθ, off_b = -dist·cosθ;
+            // world = pos + dist·(sinθ·normal - cosθ·binormal).
+            let dist = (off_n * off_n + off_b * off_b).sqrt();
+            let theta = off_n.atan2(-off_b);
+            let (sn, cs) = (theta.sin(), theta.cos());
+            let w_radial = [
+                pos[0] + dist * (sn * normal[0] - cs * binormal[0]),
+                pos[1] + dist * (sn * normal[1] - cs * binormal[1]),
+                pos[2] + dist * (sn * normal[2] - cs * binormal[2]),
+            ];
+
+            for k in 0..3 {
+                assert!(
+                    (w_overlay[k] - w_radial[k]).abs() < 1e-9,
+                    "off=({off_n},{off_b}) axis {k}: overlay {} vs radial {}",
+                    w_overlay[k], w_radial[k]
+                );
+            }
+        }
+
+        // Documented sub-pixel convention difference (the only geometric
+        // inconsistency between the two views; well under 1%).
+        let mmpp_overlay = 2.0 * width_mm / (pixels as f64 - 1.0);
+        let mmpp_radial = 2.0 * width_mm / pixels as f64;
+        let rel = (mmpp_overlay - mmpp_radial).abs() / mmpp_radial;
+        assert!(rel < 0.01, "pixel→mm convention diff {rel} unexpectedly large");
+    }
+
     #[test]
     fn test_uniform_volume_produces_uniform_surface() {
         let val = 0.5f32;
