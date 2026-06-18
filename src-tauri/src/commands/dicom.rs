@@ -311,16 +311,6 @@ pub async fn list_patients(
         let has_seeds = patient_has_seeds(&app, &path_str);
         let complete = patient_session_summary(&app, &path_str);
         let status = status_for(complete, has_seeds);
-        if path_str.contains("512339528") {
-            let sd = app.path().app_data_dir().map(|d| d.join("sessions"));
-            let cnt = sd.as_ref().ok()
-                .and_then(|d| std::fs::read_dir(d).ok())
-                .map(|r| r.flatten().count());
-            let _ = std::fs::write(
-                format!("{}/pcat_lp.txt", std::env::var("HOME").unwrap_or_default()),
-                format!("path_str={path_str}\nhas_seeds={has_seeds}\ncomplete={complete}\nstatus={status}\nsessions_dir={sd:?}\nsessions_count={cnt:?}\n"),
-            );
-        }
         let flag = read_flag_at(&flag_file_path(&flags_base, &path_str))
             .ok()
             .flatten();
@@ -1430,43 +1420,6 @@ mod tests {
         assert_eq!(status_for(true, false), "complete");
         assert_eq!(status_for(false, true), "in_progress");
         assert_eq!(status_for(false, false), "not_started");
-    }
-
-    /// TEMP diagnostic — replicates list_patients' patient_path derivation by
-    /// WALKING the real SMB root (not hardcoding the path), then scans sessions.
-    #[test]
-    fn diag_walk_512339528() {
-        let root = "/Volumes/Molloilab/Shu Nie/UCI NAEOTOM CCTA Data";
-        let sessions = std::path::Path::new(
-            "/Users/shunie/Library/Application Support/com.pcat.workstation/sessions",
-        );
-        let mut found = false;
-        for e in std::fs::read_dir(root).expect("read root").flatten() {
-            if e.file_name().to_string_lossy() != "512339528" {
-                continue;
-            }
-            found = true;
-            let patient_path = e.path().to_string_lossy().to_string();
-            let needle = sanitize_for_filename(&patient_path);
-            eprintln!("WALK patient_path={patient_path:?}");
-            eprintln!("WALK needle={needle}");
-            let mut nm = 0;
-            let mut complete = false;
-            for se in std::fs::read_dir(sessions).expect("read sessions").flatten() {
-                let n = se.file_name().to_string_lossy().to_string();
-                if !n.contains(&needle) {
-                    continue;
-                }
-                nm += 1;
-                let j: serde_json::Value =
-                    serde_json::from_str(&std::fs::read_to_string(se.path()).unwrap()).unwrap();
-                let (f, m) = session_flags(&j);
-                eprintln!("WALK SESS_MATCH {n} f={f} m={m}");
-                complete |= f && m;
-            }
-            eprintln!("WALK nm={nm} complete={complete}");
-        }
-        assert!(found, "512339528 must be under root");
     }
 
     /// Minimal single-column volume: `z_positions.len()` slices, in-plane
