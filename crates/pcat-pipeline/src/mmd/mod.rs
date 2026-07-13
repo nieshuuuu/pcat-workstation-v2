@@ -9,4 +9,4 @@ pub use water_lipid::{
     decompose_slice, decompose_volume_gls, gls_fw, self_calibrate, sigma_cov, WlAnchor,
     WlCalibration,
 };
-pub use wlp::{decompose_slice_wlp, tv_coupled, WlpMaps, WlpModel};
+pub use wlp::{decompose_slice_wlp, measure_noise, tv_coupled, WlpMaps, WlpModel};

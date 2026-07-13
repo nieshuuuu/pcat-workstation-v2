@@ -113,6 +113,13 @@ pub struct WlpModel {
     pub gate: [f64; 2],
     /// Whether this surface is the frozen sim model (true) or a real-data refit.
     pub is_baked: bool,
+    /// Whether the noise (`sigma_lo`/`sigma_hi`/`rho`/`sigma_hu`) was self-measured
+    /// from the loaded volume (true) or is the sim's baked noise (false). The
+    /// sim's σ₁₅₀≈2.3 is ~10× too low vs real NAEOTOM (~22 HU), so the σ_f readout
+    /// + TV weight are only honest once this is true. The SURFACE stays frozen
+    /// either way (self-calibrating it needs known W/L/P rods).
+    #[serde(default)]
+    pub noise_measured: bool,
     /// [nz, ny, nx] of the dual-energy grid this model was registered against,
     /// so the frontend can size the slice viewer. The surface itself is
     /// volume-independent; this is filled in at registration (baked ⇒ [0,0,0]).
@@ -172,8 +179,23 @@ impl WlpModel {
             bias_hu: [-2.2625705360740223, 0.5131352796373362],
             gate: [-300.0, 250.0],
             is_baked: true,
+            noise_measured: false,
             dims: [0, 0, 0],
         }
+    }
+
+    /// Replace the baked (sim) noise with real noise self-measured from the
+    /// loaded volume. Real PCCT noise is ~material-uniform (path-dominated), so a
+    /// single σ per energy over soft tissue is representative — hence flat σ(HU)
+    /// (constant term only), not the sim's convex smile. The surface is untouched.
+    pub fn set_measured_noise(&mut self, sigma_lo: f64, sigma_hi: f64, rho: f64) {
+        let (s_lo, s_hi) = (sigma_lo.max(1e-3), sigma_hi.max(1e-3));
+        let r = rho.clamp(-0.999, 0.999);
+        self.sigma_lo = [0.0, 0.0, s_lo];
+        self.sigma_hi = [0.0, 0.0, s_hi];
+        self.rho = r;
+        self.sigma_hu = [[s_lo * s_lo, r * s_lo * s_hi], [r * s_lo * s_hi, s_hi * s_hi]];
+        self.noise_measured = true;
     }
 
     /// Endpoint matrix `G = [[hu_l0−hu_w0, hu_p0−hu_w0], [hu_l1−hu_w1, hu_p1−hu_w1]]`,
@@ -406,6 +428,72 @@ pub fn tv_coupled(
     (fl, fp)
 }
 
+/// Self-measure the real per-energy noise `(σ_lo, σ_hi, ρ)` from the loaded
+/// dual-energy volume over gated soft tissue, so the σ_f readout + TV weight
+/// reflect the actual scanner rather than the sim.
+///
+/// Estimator: a robust MAD of the 4-neighbour Laplacian response (a high-pass
+/// that kills smooth anatomy, leaving noise) over the central-third slices —
+/// edge-insensitive (median), matches bcmmd-gaussian's `local_noise_map` to
+/// ~10%. `σ = 1.4826·median(|∇²|)/√20` (√20 = the Laplacian's noise gain). ρ
+/// from the correlation of the two channels' responses. Returns `None` if there
+/// is too little soft tissue to measure (caller keeps the baked σ).
+pub fn measure_noise(
+    low: &ndarray::Array3<f32>,
+    high: &ndarray::Array3<f32>,
+    gate: [f64; 2],
+) -> Option<(f64, f64, f64)> {
+    let (nz, ny, nx) = (low.shape()[0], low.shape()[1], low.shape()[2]);
+    if ny < 3 || nx < 3 || nz == 0 {
+        return None;
+    }
+    let lo = low.as_slice()?;
+    let hi = high.as_slice()?;
+    let plane = ny * nx;
+    let z0 = nz / 3;
+    let z1 = (2 * nz / 3).max(z0 + 1).min(nz);
+    let mut abs_lo = Vec::<f64>::new();
+    let mut abs_hi = Vec::<f64>::new();
+    let (mut sll, mut shh, mut slh) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for z in z0..z1 {
+        let b = z * plane;
+        for j in 1..ny - 1 {
+            for i in 1..nx - 1 {
+                let k = b + j * nx + i;
+                let h = hi[k] as f64;
+                if h <= gate[0] || h >= gate[1] {
+                    continue;
+                }
+                let lap = |s: &[f32]| {
+                    4.0 * s[k] as f64 - s[k - 1] as f64 - s[k + 1] as f64 - s[k - nx] as f64 - s[k + nx] as f64
+                };
+                let (ll, lh) = (lap(lo), lap(hi));
+                abs_lo.push(ll.abs());
+                abs_hi.push(lh.abs());
+                sll += ll * ll;
+                shh += lh * lh;
+                slh += ll * lh;
+            }
+        }
+    }
+    if abs_lo.len() < 2000 {
+        return None;
+    }
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[v.len() / 2]
+    };
+    let gain = 20.0_f64.sqrt(); // std of the 4-neighbour Laplacian for white noise = σ·√20
+    let s_lo = 1.4826 * median(&mut abs_lo) / gain;
+    let s_hi = 1.4826 * median(&mut abs_hi) / gain;
+    let rho = if sll > 0.0 && shh > 0.0 {
+        slh / (sll.sqrt() * shh.sqrt())
+    } else {
+        0.0
+    };
+    Some((s_lo, s_hi, rho))
+}
+
 /// The four delivered per-voxel maps of one axial slice, row-major `ny·nx`.
 /// Gated voxels are `NaN` in every plane. `fw + fl + fp = 1` where finite.
 pub struct WlpMaps {
@@ -602,6 +690,49 @@ mod tests {
         let stripped = json.replace(",\"dims\":[0,0,0]", "");
         let old: WlpModel = serde_json::from_str(&stripped).unwrap();
         assert_eq!(old.dims, [0, 0, 0]);
+    }
+
+    #[test]
+    fn measure_noise_recovers_planted_sigma() {
+        // Plant known white noise (σ_lo=20, σ_hi=22, ρ≈0) on a smooth soft-tissue
+        // background; the MAD-Laplacian estimator must recover it within ~15%.
+        let (nz, ny, nx) = (9usize, 40usize, 40usize);
+        let mut low = ndarray::Array3::<f32>::zeros((nz, ny, nx));
+        let mut high = ndarray::Array3::<f32>::zeros((nz, ny, nx));
+        // deterministic N(0,1) via Irwin-Hall (12 LCG uniforms − 6; mean 6, var 1).
+        let gauss = |seed: u64| -> f64 {
+            let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+            let mut sum = 0.0;
+            for _ in 0..12 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                sum += ((s >> 40) as f64) / ((1u64 << 24) as f64);
+            }
+            sum - 6.0
+        };
+        for z in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    let k = (z * ny * nx + j * nx + i) as u64;
+                    let bg = 20.0 + 0.5 * (i as f64); // smooth ramp (killed by the Laplacian)
+                    low[[z, j, i]] = (bg + 20.0 * gauss(2 * k)) as f32;
+                    high[[z, j, i]] = (bg + 22.0 * gauss(2 * k + 1)) as f32;
+                }
+            }
+        }
+        let (s_lo, s_hi, _rho) = measure_noise(&low, &high, [-300.0, 250.0]).expect("should measure");
+        assert!((s_lo - 20.0).abs() < 3.5, "σ_lo off: {s_lo}");
+        assert!((s_hi - 22.0).abs() < 3.5, "σ_hi off: {s_hi}");
+    }
+
+    #[test]
+    fn set_measured_noise_is_flat_and_flagged() {
+        let mut m = WlpModel::baked();
+        assert!(!m.noise_measured);
+        m.set_measured_noise(22.0, 21.0, 0.71);
+        assert!(m.noise_measured);
+        assert_eq!(m.sigma_lo, [0.0, 0.0, 22.0]); // flat: material-uniform
+        assert!((m.sigma_hu[0][0] - 484.0).abs() < 1e-9);
+        assert!((m.sigma_fl(-100.0, -80.0) > 0.3), "real σ_fl should be ~2× the sim's ~0.2");
     }
 
     #[test]

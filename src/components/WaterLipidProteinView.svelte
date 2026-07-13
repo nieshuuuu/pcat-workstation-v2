@@ -445,9 +445,9 @@
         <!-- Sim-calibration caveat -->
         {#if model.is_baked}
           <div class="rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-[10px] leading-snug text-amber-500/90">
-            Frozen surface, calibrated on simulation ({model.low_kev}/{model.high_kev} keV). On real data
-            the fractions are a first estimate; the CCC guarantee is a sim number. Refit per scanner
-            (wlp-decomposition · apply_wlp_model.jl).
+            <span class="font-semibold">Surface</span> frozen, sim-calibrated ({model.low_kev}/{model.high_kev} keV) —
+            fractions are a first estimate, CCC is a sim number, refit per scanner.
+            <span class="font-semibold">Noise</span> {model.noise_measured ? 'self-calibrated from this volume ✓' : 'sim (could not measure — too little soft tissue)'}.
           </div>
         {/if}
 
@@ -458,8 +458,8 @@
             <span>HU water</span><span class="text-text-primary">({fmt(model.hu_w[0])}, {fmt(model.hu_w[1])})</span>
             <span>HU lipid</span><span class="text-text-primary">({fmt(model.hu_l[0])}, {fmt(model.hu_l[1])})</span>
             <span>HU protein</span><span class="text-text-primary">({fmt(model.hu_p[0])}, {fmt(model.hu_p[1])})</span>
-            <span>σ {model.low_kev}keV</span><span class="text-text-primary">{fmt(Math.sqrt(model.sigma_hu[0][0]))}</span>
-            <span>σ {model.high_kev}keV</span><span class="text-text-primary">{fmt(Math.sqrt(model.sigma_hu[1][1]))}</span>
+            <span>σ {model.low_kev}keV</span><span class="text-text-primary">{fmt(Math.sqrt(model.sigma_hu[0][0]))} {model.noise_measured ? '(meas)' : '(sim)'}</span>
+            <span>σ {model.high_kev}keV</span><span class="text-text-primary">{fmt(Math.sqrt(model.sigma_hu[1][1]))} {model.noise_measured ? '(meas)' : '(sim)'}</span>
             <span>ρ</span><span class="text-text-primary">{model.rho.toFixed(3)}</span>
             <span>gate (150keV)</span><span class="text-text-primary">[{fmt(model.gate[0])}, {fmt(model.gate[1])}]</span>
           </div>

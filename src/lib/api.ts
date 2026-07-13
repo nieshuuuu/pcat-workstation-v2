@@ -498,6 +498,9 @@ export type WlpModel = {
   bias_hu: [number, number];
   gate: [number, number];
   is_baked: boolean;
+  /** Whether σ/ρ were self-measured from the loaded volume (true) or are the
+   *  sim's baked noise (false). The surface stays frozen either way. */
+  noise_measured: boolean;
   /** [nz, ny, nx] of the dual-energy grid, for sizing the slice viewer. */
   dims: [number, number, number];
 };

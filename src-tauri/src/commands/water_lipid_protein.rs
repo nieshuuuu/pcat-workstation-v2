@@ -39,12 +39,14 @@ const WLP_KEV_TOL: f64 = 1.0;
 pub async fn run_water_lipid_protein(
     state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<WlpModel, String> {
-    let (low_kev, high_kev, dims) = {
+    let (low, high, low_kev, high_kev, dims) = {
         let guard = state.lock().map_err(|e| format!("lock poisoned: {e}"))?;
         let de = guard.dual_energy.as_ref().ok_or_else(|| {
             "no dual-energy volume loaded — load a two-keV (MonoPlus 70/150) series first".to_string()
         })?;
         (
+            Arc::clone(&de.low),
+            Arc::clone(&de.high),
             de.low_energy_kev,
             de.high_energy_kev,
             [de.low.shape()[0], de.low.shape()[1], de.low.shape()[2]],
@@ -59,8 +61,19 @@ pub async fn run_water_lipid_protein(
         ));
     }
 
+    // Self-calibrate the NOISE from this volume (the surface stays frozen). The
+    // sim's σ₁₅₀≈2.3 is ~10× too low vs real NAEOTOM (~22 HU), so without this
+    // the σ_f readout + TV weight are dishonest. Off the lock (volume scan).
     let mut model = WlpModel::baked();
-    model.dims = dims; // record the grid this registration applies to (viewer sizing)
+    model.dims = dims;
+    let gate = model.gate;
+    let measured = tokio::task::spawn_blocking(move || mmd::measure_noise(&low, &high, gate))
+        .await
+        .map_err(|e| format!("noise measurement task failed: {e}"))?;
+    if let Some((s_lo, s_hi, rho)) = measured {
+        model.set_measured_noise(s_lo, s_hi, rho);
+    } // else: too little soft tissue — keep the baked sim noise (noise_measured stays false)
+
     {
         let mut guard = state.lock().map_err(|e| format!("lock poisoned: {e}"))?;
         guard.wlp_model = Some(model.clone());
