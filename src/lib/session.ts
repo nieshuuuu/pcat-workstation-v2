@@ -11,11 +11,12 @@
  * everything; one loadSession() restores it into the stores.
  */
 
-import { saveSession as saveSessionCmd, loadSession as loadSessionCmd, restoreWlCalibration } from '$lib/api';
+import { saveSession as saveSessionCmd, loadSession as loadSessionCmd, restoreWlCalibration, restoreWlpModel } from '$lib/api';
 import { seedStore } from '$lib/stores/seedStore.svelte';
 import { pipelineStore } from '$lib/stores/pipelineStore.svelte';
 import { mmdStore } from '$lib/stores/mmdStore.svelte';
 import { wlStore } from '$lib/stores/wlStore.svelte';
+import { wlpStore } from '$lib/stores/wlpStore.svelte';
 
 const SESSION_VERSION = 1;
 
@@ -31,6 +32,7 @@ export function clearSession() {
   pipelineStore.reset();
   mmdStore.clear();
   wlStore.reset();
+  wlpStore.reset();
 }
 
 /** Persist seeds + FAI + water/lipid quantification for this patient. */
@@ -44,6 +46,8 @@ export async function saveSession(dicomPath: string): Promise<void> {
     mmd: { summary: mmdStore.summary, surfaces: mmdStore.surfaces },
     // Whole-volume water/lipid calibration (the SSoT; f_w/σ_f maps derive from it).
     wl: wlStore.calibration,
+    // Whole-volume water/lipid/protein poly2 model (drives the 3-material viewer).
+    wlp: wlpStore.model,
   };
   await saveSessionCmd(dicomPath, JSON.stringify(bundle));
 }
@@ -66,6 +70,13 @@ export async function loadSession(dicomPath: string): Promise<SessionMeta | null
     try { await restoreWlCalibration(bundle.wl); } catch { /* dual-energy not loaded */ }
   } else {
     wlStore.reset();
+  }
+  if (bundle.wlp) {
+    wlpStore.restore(bundle.wlp);
+    // Same best-effort round-trip so getWlpSlice can derive maps on reopen.
+    try { await restoreWlpModel(bundle.wlp); } catch { /* dual-energy not loaded */ }
+  } else {
+    wlpStore.reset();
   }
   return { savedAt: bundle.savedAt ?? '' };
 }

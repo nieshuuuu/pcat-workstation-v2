@@ -6,7 +6,7 @@ use pcat_pipeline::annotation::AnnotationTarget;
 use pcat_pipeline::cpr::CprFrame;
 use pcat_pipeline::dicom_load::VolumeMetadata as PipelineVolumeMetadata;
 use pcat_pipeline::dicom_loader::DualEnergyVolume;
-use pcat_pipeline::mmd::{MmdResult, WlCalibration};
+use pcat_pipeline::mmd::{MmdResult, WlCalibration, WlpModel};
 pub use pcat_pipeline::types::LoadedVolume;
 
 use crate::volume_cache::{VolumeCache, VOLUME_CACHE_MAX};
@@ -59,6 +59,11 @@ pub struct AppState {
     /// The single source of truth — per-slice f_w/σ_f maps are derived from it
     /// on demand by `get_wl_slice`, so no result volume is cached.
     pub wl_calibration: Option<WlCalibration>,
+    /// Frozen water/lipid/protein poly2 surface for the whole-volume 3-material
+    /// viewer. Baked (sim-calibrated, 70/150 keV) — not measured from the
+    /// patient. Present ⇒ the WLP viewer has been run; slices are derived from
+    /// it on demand by `get_wlp_slice`.
+    pub wlp_model: Option<WlpModel>,
     /// (dicom_dir, series_uid) of the volume currently in `volume`. None if
     /// unloaded. Used by reuse_loaded_volume to skip re-decode on A→B→A reload.
     pub current_volume_key: Option<(String, String)>,
@@ -81,6 +86,7 @@ impl AppState {
             finalized: HashMap::new(),
             mmd_result: None,
             wl_calibration: None,
+            wlp_model: None,
             current_volume_key: None,
             last_metadata: None,
         }

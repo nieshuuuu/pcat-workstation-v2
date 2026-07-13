@@ -53,6 +53,9 @@ pub fn run() {
             commands::water_lipid::run_water_lipid,
             commands::water_lipid::get_wl_slice,
             commands::water_lipid::restore_wl_calibration,
+            commands::water_lipid_protein::run_water_lipid_protein,
+            commands::water_lipid_protein::get_wlp_slice,
+            commands::water_lipid_protein::restore_wlp_model,
             commands::flag::set_patient_flag,
             commands::flag::get_patient_flag,
         ])

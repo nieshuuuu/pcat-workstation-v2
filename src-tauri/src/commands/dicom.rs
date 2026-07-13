@@ -488,6 +488,7 @@ pub async fn load_series(
         let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
         guard.dual_energy = None;
         guard.wl_calibration = None;
+        guard.wlp_model = None;
     }
 
     let dir_path = PathBuf::from(dir);
@@ -698,6 +699,7 @@ pub async fn load_dual_energy(
         let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
         guard.dual_energy = Some(de);
         guard.wl_calibration = None; // new pair → discard any prior calibration
+        guard.wlp_model = None;
     }
 
     let _ = app.emit("dicom_load_progress", ProgressEvent {
@@ -1004,6 +1006,7 @@ pub async fn load_patient_all(
         let mut guard = state.lock().map_err(|e| format!("state lock poisoned: {e}"))?;
         guard.dual_energy = None;
         guard.wl_calibration = None;
+        guard.wlp_model = None;
     }
 
     let total = subdirs.len();

@@ -472,6 +472,89 @@ export async function getWlSlice(z: number, anchor: WlAnchor): Promise<WlSlice> 
   return { z: meta.z, ny: meta.ny, nx: meta.nx, anchor: meta.anchor, ct, fw, sf };
 }
 
+/* ── Water/Lipid/Protein (3-material poly2 surface) ─────────────
+ * The 3-material successor to the WL GLS. Uses a FROZEN poly2 calibration
+ * surface (baked from the wlp-decomposition sim at 70/150 keV), not a
+ * self-calibration — see WlpModel.is_baked and the sim→real transfer caveat.
+ * Replaces the WL backing of the whole-volume viewer; the ROI overlay still
+ * uses the 2-material GLS. */
+
+/** The frozen (or refit) WLP surface + noise model. Mirrors the Rust `WlpModel`
+ *  (snake_case). Coefficients are sim-calibrated for 70/150 keV. */
+export type WlpModel = {
+  low_kev: number;
+  high_kev: number;
+  cw: number[]; // poly2 → f_w (6 coeffs)
+  cl: number[]; // poly2 → f_l
+  cp: number[]; // poly2 → f_p
+  cl_aff: number[]; // affine f_l (3 coeffs)
+  hu_w: [number, number];
+  hu_l: [number, number];
+  hu_p: [number, number];
+  sigma_lo: [number, number, number];
+  sigma_hi: [number, number, number];
+  rho: number;
+  sigma_hu: [[number, number], [number, number]];
+  bias_hu: [number, number];
+  gate: [number, number];
+  is_baked: boolean;
+  /** [nz, ny, nx] of the dual-energy grid, for sizing the slice viewer. */
+  dims: [number, number, number];
+};
+
+/** One decoded axial slice: CT HU (i16) + f_w + f_l + f_p + σ_f (all f32, NaN
+ *  outside the soft-tissue gate). Unlike WlSlice, all three fractions are sent
+ *  (f_l ≠ 1 − f_w for a 3-material model). */
+export type WlpSlice = {
+  z: number;
+  ny: number;
+  nx: number;
+  ct: Int16Array;
+  fw: Float32Array;
+  fl: Float32Array;
+  fp: Float32Array;
+  sf: Float32Array;
+};
+
+/** Register the baked WLP poly2 surface for the loaded dual-energy volume.
+ *  Fails if the loaded pair is not 70/150 keV (the surface's calibration). */
+export async function runWaterLipidProtein(): Promise<WlpModel> {
+  return invoke<WlpModel>('run_water_lipid_protein');
+}
+
+/** Restore a saved WLP model into backend state (session reload). */
+export async function restoreWlpModel(model: WlpModel): Promise<void> {
+  return invoke<void>('restore_wlp_model', { model });
+}
+
+/** Derive one axial slice's CT + f_w + f_l + f_p + σ_f maps from the stored model. */
+export async function getWlpSlice(z: number): Promise<WlpSlice> {
+  const buf = await invoke<ArrayBuffer>('get_wlp_slice', { z });
+  const view = new DataView(buf);
+  const metaLen = view.getUint32(0, true);
+  const metaBytes = new Uint8Array(buf, 4, metaLen);
+  const meta = JSON.parse(new TextDecoder().decode(metaBytes)) as {
+    z: number;
+    ny: number;
+    nx: number;
+  };
+
+  const plane = meta.ny * meta.nx;
+  let off = 4 + metaLen;
+  // Region order MUST match build_wlp_slice_frame: ct i16, then fw/fl/fp/sf f32.
+  const ct = new Int16Array(buf.slice(off, off + plane * 2));
+  off += plane * 2;
+  const fw = new Float32Array(buf.slice(off, off + plane * 4));
+  off += plane * 4;
+  const fl = new Float32Array(buf.slice(off, off + plane * 4));
+  off += plane * 4;
+  const fp = new Float32Array(buf.slice(off, off + plane * 4));
+  off += plane * 4;
+  const sf = new Float32Array(buf.slice(off, off + plane * 4));
+
+  return { z: meta.z, ny: meta.ny, nx: meta.nx, ct, fw, fl, fp, sf };
+}
+
 /* ── Save/Load annotations + CSV export ───────────────── */
 
 export type AnnotationStateJson = {
