@@ -527,9 +527,11 @@ export async function restoreWlpModel(model: WlpModel): Promise<void> {
   return invoke<void>('restore_wlp_model', { model });
 }
 
-/** Derive one axial slice's CT + f_w + f_l + f_p + σ_f maps from the stored model. */
-export async function getWlpSlice(z: number): Promise<WlpSlice> {
-  const buf = await invoke<ArrayBuffer>('get_wlp_slice', { z });
+/** Derive one axial slice's CT + f_w + f_l + f_p + σ_f maps from the stored model.
+ *  `smoothing` is the TV strength (λ): 0 = raw per-voxel (noisy), ~8 = WL-map
+ *  smoothness. The 3-material decode is ~10× noisier than the 2-material line. */
+export async function getWlpSlice(z: number, smoothing: number): Promise<WlpSlice> {
+  const buf = await invoke<ArrayBuffer>('get_wlp_slice', { z, smoothing });
   const view = new DataView(buf);
   const metaLen = view.getUint32(0, true);
   const metaBytes = new Uint8Array(buf, 4, metaLen);

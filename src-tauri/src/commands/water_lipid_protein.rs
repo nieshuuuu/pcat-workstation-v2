@@ -96,9 +96,15 @@ struct WlpSliceMeta {
 /// CT HU (low energy, LE) ++ `ny·nx` f32 f_w ++ f_l ++ f_p ++ σ_f. Gated voxels
 /// are `NaN` in every fraction plane. Unlike the 2-material slice, ALL THREE
 /// fractions are sent (f_l is no longer 1 − f_w).
+/// `smoothing` is the TV strength (λ): 0 ⇒ raw per-voxel maps (noisy but the
+/// honest point estimate); ~8 (the frontend default) ⇒ WL-map smoothness. The
+/// 3-material decode is ~10× noisier than the 2-material line, so a legible map
+/// needs strong smoothing — this is a live knob because the ideal strength is
+/// data-dependent.
 #[tauri::command]
 pub async fn get_wlp_slice(
     z: usize,
+    smoothing: f64,
     state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<Response, String> {
     let (low, high, model) = {
@@ -114,16 +120,18 @@ pub async fn get_wlp_slice(
         (Arc::clone(&de.low), Arc::clone(&de.high), model)
     };
 
-    let framed = tokio::task::spawn_blocking(move || build_wlp_slice_frame(z, &low, &high, &model))
+    let framed = tokio::task::spawn_blocking(move || build_wlp_slice_frame(z, smoothing, &low, &high, &model))
         .await
         .map_err(|e| format!("get_wlp_slice task failed: {e}"))??;
 
     Ok(Response::new(framed))
 }
 
-/// Extract slice `z`, decompose it (poly2 + coupled TV), and pack the framed bytes.
+/// Extract slice `z`, decompose it (poly2 + coupled TV at strength `smoothing`),
+/// and pack the framed bytes.
 fn build_wlp_slice_frame(
     z: usize,
+    smoothing: f64,
     low: &Array3<f32>,
     high: &Array3<f32>,
     model: &WlpModel,
@@ -140,7 +148,7 @@ fn build_wlp_slice_frame(
     let low_slice = &lo[base..base + plane];
     let high_slice = &hi[base..base + plane];
 
-    let maps = mmd::decompose_slice_wlp(low_slice, high_slice, model, ny, nx, true);
+    let maps = mmd::decompose_slice_wlp(low_slice, high_slice, model, ny, nx, smoothing.max(0.0));
 
     // CT as i16 HU (low energy, clamped to the loader's range).
     let mut ct = Vec::<i16>::with_capacity(plane);

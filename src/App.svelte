@@ -11,6 +11,7 @@
   import MprPanel from './components/MprPanel.svelte';
   import MmdAnalysisView from './components/MmdAnalysisView.svelte';
   import WaterLipidView from './components/WaterLipidView.svelte';
+  import WaterLipidProteinView from './components/WaterLipidProteinView.svelte';
   import PatientBrowser from './components/PatientBrowser.svelte';
   import SeedToolbar from './components/SeedToolbar.svelte';
   import HintLine from './components/HintLine.svelte';
@@ -43,7 +44,7 @@
   import { derivePatientStatus, patientIdOf } from '$lib/patientStatus';
 
   /* ── Tab state ─────────────────────────────────────── */
-  type AppTab = 'editor' | 'mmd' | 'wl';
+  type AppTab = 'editor' | 'mmd' | 'wl' | 'wlp';
   let activeTab = $state<AppTab>('editor');
 
   /** Centerline of the currently active vessel (for MmdAnalysisView). */
@@ -718,6 +719,18 @@
         {/if}
       </button>
       <button
+        class="relative px-3 py-1.5 text-xs font-medium transition-colors {activeTab === 'wlp'
+          ? 'text-accent'
+          : 'text-text-secondary hover:text-text-primary'}"
+        onclick={() => { activeTab = 'wlp'; }}
+        title="Whole-volume 3-material water/lipid/protein decomposition (frozen poly2 surface, 70/150 keV)"
+      >
+        Water/Lipid/Protein
+        {#if activeTab === 'wlp'}
+          <span class="absolute inset-x-0 bottom-0 h-[2px] bg-accent"></span>
+        {/if}
+      </button>
+      <button
         class="relative px-3 py-1.5 text-xs font-medium transition-colors {activeTab === 'mmd'
           ? 'text-accent'
           : 'text-text-secondary hover:text-text-primary'}"
@@ -762,6 +775,12 @@
         class:hidden={activeTab !== 'wl'}
       >
         <WaterLipidView />
+      </div>
+      <div
+        class="absolute inset-0 flex flex-col"
+        class:hidden={activeTab !== 'wlp'}
+      >
+        <WaterLipidProteinView />
       </div>
     {/if}
   </main>

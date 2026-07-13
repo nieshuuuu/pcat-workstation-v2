@@ -31,7 +31,18 @@
 //! noise (σ_lo ≈ 9.7, σ_hi ≈ 2.3 HU) is likewise the sim's; it only weights the
 //! TV pool and the MLE metric, not the point decode.
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+
+/// Default TV smoothing strength for the delivered map. The 3-material per-voxel
+/// decode has σ_fl ≈ 0.2 (the ill-conditioned sliver), ~10× the 2-material line
+/// projection, so it needs STRONG smoothing — this is the wl-noise-aware-mmd
+/// reader's regime (λ≈8), NOT the sim phantom's λ=0.05 (which barely dented the
+/// clean sim noise). The data weight `sigma_f_weight` is ≈18–29, so λ must be of
+/// that order for smoothing to dominate. Edge-preserving via the Huber `eps`.
+pub const TV_LAMBDA_DEFAULT: f64 = 8.0;
+pub const TV_ITERS_DEFAULT: usize = 150;
+pub const TV_EPS_DEFAULT: f64 = 0.05;
 
 /// The 6-term quadratic surface basis `[1, h_lo, h_hi, h_lo², h_hi², h_lo·h_hi]`.
 /// Identical to `poly2` in `apply_wlp_model.jl`.
@@ -332,18 +343,23 @@ pub fn tv_coupled(
     let mut fp: Vec<f64> = (0..n).map(|k| if mask[k] { yp[k] } else { 0.0 }).collect();
     let mut fl2 = fl.clone();
     let mut fp2 = fp.clone();
-    let idx = |i: usize, j: usize| j * nx + i;
     // (di, dj) 4-neighbours.
     let neigh: [(isize, isize); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+    // Jacobi iterations: each output voxel reads only the PREVIOUS iterate, so
+    // the sweep is embarrassingly parallel over voxels (rayon).
     for _ in 0..iters {
-        for j in 0..ny {
-            for i in 0..nx {
-                let k = idx(i, j);
+        let (fl_prev, fp_prev) = (&fl, &fp);
+        fl2.par_iter_mut()
+            .zip(fp2.par_iter_mut())
+            .enumerate()
+            .for_each(|(k, (out_l, out_p))| {
                 if !mask[k] {
-                    fl2[k] = fl[k];
-                    fp2[k] = fp[k];
-                    continue;
+                    *out_l = fl_prev[k];
+                    *out_p = fp_prev[k];
+                    return;
                 }
+                let i = k % nx;
+                let j = k / nx;
                 let wij = if w[k].is_finite() { w[k] } else { 1.0 };
                 let mut rl = wij * yl[k];
                 let mut rp = wij * yp[k];
@@ -354,15 +370,17 @@ pub fn tv_coupled(
                     if ni < 0 || nj < 0 || ni >= nx as isize || nj >= ny as isize {
                         continue;
                     }
-                    let nk = idx(ni as usize, nj as usize);
+                    let nk = (nj as usize) * nx + (ni as usize);
                     if !mask[nk] {
                         continue;
                     }
-                    let dl = fl[nk] - fl[k];
-                    let dp = fp[nk] - fp[k];
+                    let dl = fl_prev[nk] - fl_prev[k];
+                    let dp = fp_prev[nk] - fp_prev[k];
+                    // Huber weight: small |∇| ⇒ strong smoothing (c≈λ/eps),
+                    // large |∇| (a real fat↔muscle edge) ⇒ c collapses, edge kept.
                     let c = lambda / (dl * dl + dp * dp).sqrt().max(eps);
-                    rl += c * fl[nk];
-                    rp += c * fp[nk];
+                    rl += c * fl_prev[nk];
+                    rp += c * fp_prev[nk];
                     den += c;
                 }
                 // Project onto the non-negative simplex (a,b ≥ 0, a+b ≤ 1).
@@ -373,10 +391,9 @@ pub fn tv_coupled(
                     a /= s;
                     b /= s;
                 }
-                fl2[k] = a;
-                fp2[k] = b;
-            }
-        }
+                *out_l = a;
+                *out_p = b;
+            });
         std::mem::swap(&mut fl, &mut fl2);
         std::mem::swap(&mut fp, &mut fp2);
     }
@@ -408,15 +425,20 @@ pub struct WlpMaps {
 /// Gating is on the HIGH-energy channel (`model.gate`, −300..250 HU at 150 keV
 /// for the baked model) — matching the notebook, which gates on the high VMI.
 /// The CT shown by the caller is the low-energy image; gate channel and display
-/// channel are independent. `tv` toggles the TV pool (raw per-voxel maps if
-/// false — noisier, especially f_p, but the honest point estimate).
+/// channel are independent.
+///
+/// `tv_lambda` is the TV smoothing strength: `0` ⇒ raw per-voxel maps (noisy,
+/// the honest point estimate); a positive value applies the coupled Huber-TV at
+/// that strength ([`TV_LAMBDA_DEFAULT`] ≈ WL-map smoothness). The 3-material
+/// per-voxel decode is intrinsically ~10× noisier than the 2-material line, so a
+/// legible delivered map needs strong smoothing.
 pub fn decompose_slice_wlp(
     low_slice: &[f32],
     high_slice: &[f32],
     model: &WlpModel,
     ny: usize,
     nx: usize,
-    tv: bool,
+    tv_lambda: f64,
 ) -> WlpMaps {
     assert_eq!(low_slice.len(), high_slice.len(), "slice length mismatch");
     assert_eq!(low_slice.len(), ny * nx, "slice length ≠ ny·nx");
@@ -446,8 +468,8 @@ pub fn decompose_slice_wlp(
         sf[k] = model.sigma_fl(l, h) as f32;
     }
 
-    let (fl_d, fp_d) = if tv {
-        tv_coupled(&fl_raw, &fp_raw, &mask, ny, nx, 0.05, 25, 0.04, &w)
+    let (fl_d, fp_d) = if tv_lambda > 0.0 {
+        tv_coupled(&fl_raw, &fp_raw, &mask, ny, nx, tv_lambda, TV_ITERS_DEFAULT, TV_EPS_DEFAULT, &w)
     } else {
         let fl: Vec<f64> = (0..n).map(|k| if mask[k] { fl_raw[k] } else { f64::NAN }).collect();
         let fp: Vec<f64> = (0..n).map(|k| if mask[k] { fp_raw[k] } else { f64::NAN }).collect();
@@ -477,7 +499,7 @@ mod tests {
         // 3 voxels: lung (gated on the high channel), water, real-adipose.
         let low = [-800.0_f32, 0.0, -104.0];
         let high = [-700.0_f32, 0.0, -81.0];
-        let maps = decompose_slice_wlp(&low, &high, &m, 1, 3, false);
+        let maps = decompose_slice_wlp(&low, &high, &m, 1, 3, 0.0); // 0 = raw, no TV
         assert!(
             maps.fw[0].is_nan() && maps.fl[0].is_nan() && maps.fp[0].is_nan(),
             "lung must gate to NaN"
@@ -580,6 +602,49 @@ mod tests {
         let stripped = json.replace(",\"dims\":[0,0,0]", "");
         let old: WlpModel = serde_json::from_str(&stripped).unwrap();
         assert_eq!(old.dims, [0, 0, 0]);
+    }
+
+    #[test]
+    fn strong_tv_denoises_at_realistic_weight() {
+        // Regression for the "too noisy, nothing visible" report: at the real
+        // data weight (sigma_f_weight ≈ 18–29), a weak λ (the old 0.05) leaves
+        // ~96% of the per-voxel noise; the default λ must actually smooth. Build
+        // a noisy uniform patch (true f_l=0.6) split by a real edge (0.6 | 0.1),
+        // at wij≈25, and check: noise drops a lot AND the edge survives.
+        let (ny, nx) = (24usize, 24usize);
+        let n = ny * nx;
+        let mut yl = vec![0.0_f64; n];
+        let mut yp = vec![0.05_f64; n];
+        let mask = vec![true; n];
+        let w = vec![25.0_f64; n]; // realistic data weight
+        // deterministic pseudo-noise (no rng): ±0.25 checkerboard-ish jitter.
+        let jit = |k: usize| ((k * 2654435761usize >> 13) & 0xff) as f64 / 255.0 - 0.5;
+        for k in 0..n {
+            let i = k % nx;
+            let base = if i < nx / 2 { 0.60 } else { 0.10 }; // real edge at the midline
+            yl[k] = (base + 0.5 * jit(k)).clamp(0.0, 1.0);
+        }
+        let raw_std = |v: &[f64], lo: usize, hi: usize| {
+            let cells: Vec<f64> = (0..n).filter(|&k| { let i = k % nx; i >= lo && i < hi }).map(|k| v[k]).collect();
+            let m = cells.iter().sum::<f64>() / cells.len() as f64;
+            (cells.iter().map(|x| (x - m).powi(2)).sum::<f64>() / cells.len() as f64).sqrt()
+        };
+        let noisy_std = raw_std(&yl, 0, nx / 2);
+        let weak = tv_coupled(&yl, &yp, &mask, ny, nx, 0.05, TV_ITERS_DEFAULT, TV_EPS_DEFAULT, &w);
+        let strong = tv_coupled(&yl, &yp, &mask, ny, nx, TV_LAMBDA_DEFAULT, TV_ITERS_DEFAULT, TV_EPS_DEFAULT, &w);
+        let weak_std = raw_std(&weak.0, 0, nx / 2);
+        let strong_std = raw_std(&strong.0, 0, nx / 2);
+        // Weak λ barely dents the noise; strong λ cuts it hard.
+        assert!(weak_std > 0.5 * noisy_std, "weak λ should leave most noise: {noisy_std}->{weak_std}");
+        assert!(strong_std < 0.25 * noisy_std, "strong λ should smooth the flat region: {noisy_std}->{strong_std}");
+        // The real edge survives: mean of the two halves stays well separated.
+        let mean = |v: &[f64], lo: usize, hi: usize| {
+            let c: Vec<f64> = (0..n).filter(|&k| { let i = k % nx; i >= lo && i < hi }).map(|k| v[k]).collect();
+            c.iter().sum::<f64>() / c.len() as f64
+        };
+        let left = mean(&strong.0, 2, nx / 2 - 2);
+        let right = mean(&strong.0, nx / 2 + 2, nx - 2);
+        assert!(left - right > 0.35, "edge preserved: left {left} vs right {right}");
     }
 
     #[test]
