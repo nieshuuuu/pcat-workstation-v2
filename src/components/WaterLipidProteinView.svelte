@@ -47,10 +47,10 @@
   let z = $state(0);
   let map = $state<WlMap>('fl');
   let ctOnly = $state(false);
-  // TV smoothing strength (λ). The 3-material per-voxel decode is ~10× noisier
-  // than the 2-material line, so the delivered map needs strong smoothing; 8 ≈
-  // WL-map smoothness, 0 = raw per-voxel (honest point estimate, salt-and-pepper).
-  let smoothing = $state(8);
+  // TV smoothing strength (λ), on a median-normalized weight so it's noise-scale
+  // invariant. 0 = raw per-voxel (salt-and-pepper), ~0.7 keeps rod/boundary shape
+  // while cleaning flat tissue, ≳1.2 over-smooths (boundaries bleed, blotchy).
+  let smoothing = $state(0.7);
 
   /** Latest-wins guard so slider scrubbing doesn't render a stale slice. */
   let fetchSeq = 0;
@@ -411,16 +411,16 @@
         <div>
           <div class="mb-1 flex items-center justify-between text-[10px] font-semibold uppercase tracking-wider text-text-secondary/60">
             <span>Smoothing (TV λ)</span>
-            <span class="tabular-nums text-text-secondary">{smoothing === 0 ? 'raw' : smoothing.toFixed(0)}</span>
+            <span class="tabular-nums text-text-secondary">{smoothing === 0 ? 'raw' : smoothing.toFixed(1)}</span>
           </div>
           <input
             type="range"
             class="w-full accent-accent"
             min="0"
-            max="20"
-            step="1"
+            max="3"
+            step="0.1"
             bind:value={smoothing}
-            title="3-material maps are ~10× noisier than 2-material; 0 = raw per-voxel, 8 ≈ water/lipid-map smoothness"
+            title="0 = raw per-voxel; ~0.7 keeps boundaries while cleaning flat tissue; ≳1.2 over-smooths. Noise-scale invariant."
           />
         </div>
 

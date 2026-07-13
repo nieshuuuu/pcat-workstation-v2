@@ -34,13 +34,14 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-/// Default TV smoothing strength for the delivered map. The 3-material per-voxel
-/// decode has σ_fl ≈ 0.2 (the ill-conditioned sliver), ~10× the 2-material line
-/// projection, so it needs STRONG smoothing — this is the wl-noise-aware-mmd
-/// reader's regime (λ≈8), NOT the sim phantom's λ=0.05 (which barely dented the
-/// clean sim noise). The data weight `sigma_f_weight` is ≈18–29, so λ must be of
-/// that order for smoothing to dominate. Edge-preserving via the Huber `eps`.
-pub const TV_LAMBDA_DEFAULT: f64 = 8.0;
+/// Default TV smoothing strength for the delivered map. The data weight is
+/// MEDIAN-NORMALIZED (see `decompose_slice_wlp`) so λ is noise-scale-invariant:
+/// it no longer needs re-tuning when the dose/scanner (hence the absolute noise)
+/// changes. On real 70/150 data λ≈0.5–0.8 keeps rod boundaries crisp while
+/// cleaning flat tissue; λ≳1.2 over-smooths (boundaries bleed, TV staircasing).
+/// Edge preservation comes from the Huber `eps`. (Pre-normalization this was 8,
+/// but that broke once noise self-calibration shrank the weight ~8×.)
+pub const TV_LAMBDA_DEFAULT: f64 = 0.7;
 pub const TV_ITERS_DEFAULT: usize = 150;
 pub const TV_EPS_DEFAULT: f64 = 0.05;
 
@@ -556,6 +557,23 @@ pub fn decompose_slice_wlp(
         sf[k] = model.sigma_fl(l, h) as f32;
     }
 
+    // Median-normalize the data weight over soft tissue so the TV strength λ is
+    // independent of the absolute noise level (self-calibrating the noise shifts
+    // the weight scale ~8×; without this λ would need re-tuning per dose). The
+    // relative structure — noisier/weaker-axis voxels get less weight — is kept.
+    {
+        let mut wm: Vec<f64> = (0..n).filter(|&k| mask[k]).map(|k| w[k]).collect();
+        if !wm.is_empty() {
+            wm.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let med = wm[wm.len() / 2];
+            if med > 0.0 {
+                for wk in w.iter_mut() {
+                    *wk /= med;
+                }
+            }
+        }
+    }
+
     let (fl_d, fp_d) = if tv_lambda > 0.0 {
         tv_coupled(&fl_raw, &fp_raw, &mask, ny, nx, tv_lambda, TV_ITERS_DEFAULT, TV_EPS_DEFAULT, &w)
     } else {
@@ -736,46 +754,40 @@ mod tests {
     }
 
     #[test]
-    fn strong_tv_denoises_at_realistic_weight() {
-        // Regression for the "too noisy, nothing visible" report: at the real
-        // data weight (sigma_f_weight ≈ 18–29), a weak λ (the old 0.05) leaves
-        // ~96% of the per-voxel noise; the default λ must actually smooth. Build
-        // a noisy uniform patch (true f_l=0.6) split by a real edge (0.6 | 0.1),
-        // at wij≈25, and check: noise drops a lot AND the edge survives.
+    fn tv_denoises_but_preserves_edge_at_normalized_weight() {
+        // `decompose_slice_wlp` median-normalizes the weight, so tv_coupled runs
+        // with weight ≈ 1. In that regime the default λ must clean a flat region
+        // (weak λ leaves the noise) AND keep a real edge. Build a noisy patch
+        // (true f_l=0.6) split by a real edge (0.6 | 0.1) at unit weight.
         let (ny, nx) = (24usize, 24usize);
         let n = ny * nx;
         let mut yl = vec![0.0_f64; n];
-        let mut yp = vec![0.05_f64; n];
+        let yp = vec![0.05_f64; n];
         let mask = vec![true; n];
-        let w = vec![25.0_f64; n]; // realistic data weight
-        // deterministic pseudo-noise (no rng): ±0.25 checkerboard-ish jitter.
+        let w = vec![1.0_f64; n]; // median-normalized weight
         let jit = |k: usize| ((k * 2654435761usize >> 13) & 0xff) as f64 / 255.0 - 0.5;
         for k in 0..n {
             let i = k % nx;
-            let base = if i < nx / 2 { 0.60 } else { 0.10 }; // real edge at the midline
+            let base = if i < nx / 2 { 0.60 } else { 0.10 };
             yl[k] = (base + 0.5 * jit(k)).clamp(0.0, 1.0);
         }
-        let raw_std = |v: &[f64], lo: usize, hi: usize| {
-            let cells: Vec<f64> = (0..n).filter(|&k| { let i = k % nx; i >= lo && i < hi }).map(|k| v[k]).collect();
-            let m = cells.iter().sum::<f64>() / cells.len() as f64;
-            (cells.iter().map(|x| (x - m).powi(2)).sum::<f64>() / cells.len() as f64).sqrt()
+        let std_of = |v: &[f64], lo: usize, hi: usize| {
+            let c: Vec<f64> = (0..n).filter(|&k| { let i = k % nx; i >= lo && i < hi }).map(|k| v[k]).collect();
+            let m = c.iter().sum::<f64>() / c.len() as f64;
+            (c.iter().map(|x| (x - m).powi(2)).sum::<f64>() / c.len() as f64).sqrt()
         };
-        let noisy_std = raw_std(&yl, 0, nx / 2);
-        let weak = tv_coupled(&yl, &yp, &mask, ny, nx, 0.05, TV_ITERS_DEFAULT, TV_EPS_DEFAULT, &w);
-        let strong = tv_coupled(&yl, &yp, &mask, ny, nx, TV_LAMBDA_DEFAULT, TV_ITERS_DEFAULT, TV_EPS_DEFAULT, &w);
-        let weak_std = raw_std(&weak.0, 0, nx / 2);
-        let strong_std = raw_std(&strong.0, 0, nx / 2);
-        // Weak λ barely dents the noise; strong λ cuts it hard.
-        assert!(weak_std > 0.5 * noisy_std, "weak λ should leave most noise: {noisy_std}->{weak_std}");
-        assert!(strong_std < 0.25 * noisy_std, "strong λ should smooth the flat region: {noisy_std}->{strong_std}");
-        // The real edge survives: mean of the two halves stays well separated.
-        let mean = |v: &[f64], lo: usize, hi: usize| {
+        let mean_of = |v: &[f64], lo: usize, hi: usize| {
             let c: Vec<f64> = (0..n).filter(|&k| { let i = k % nx; i >= lo && i < hi }).map(|k| v[k]).collect();
             c.iter().sum::<f64>() / c.len() as f64
         };
-        let left = mean(&strong.0, 2, nx / 2 - 2);
-        let right = mean(&strong.0, nx / 2 + 2, nx - 2);
-        assert!(left - right > 0.35, "edge preserved: left {left} vs right {right}");
+        let noisy = std_of(&yl, 0, nx / 2);
+        let weak = tv_coupled(&yl, &yp, &mask, ny, nx, 0.02, TV_ITERS_DEFAULT, TV_EPS_DEFAULT, &w);
+        let strong = tv_coupled(&yl, &yp, &mask, ny, nx, TV_LAMBDA_DEFAULT, TV_ITERS_DEFAULT, TV_EPS_DEFAULT, &w);
+        assert!(std_of(&weak.0, 0, nx / 2) > 0.5 * noisy, "weak λ should leave most noise");
+        assert!(std_of(&strong.0, 0, nx / 2) < 0.35 * noisy, "default λ should clean the flat region");
+        // The real edge survives (halves stay well separated).
+        let sep = mean_of(&strong.0, 2, nx / 2 - 2) - mean_of(&strong.0, nx / 2 + 2, nx - 2);
+        assert!(sep > 0.35, "edge preserved: separation {sep}");
     }
 
     #[test]
