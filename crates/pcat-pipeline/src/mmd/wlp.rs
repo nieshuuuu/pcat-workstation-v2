@@ -4,7 +4,9 @@
 //!
 //! This is the 3-material successor to the 2-material GLS in [`super::water_lipid`].
 //! The decode is a quadratic surface `f = poly2(HU_lo, HU_hi)` fit against
-//! known-composition rods, normalised to the water/lipid/protein simplex; ROI
+//! known-composition rods with the three PURE endpoints pinned (equality-
+//! constrained LS) so pure water/lipid/protein decode to exactly 100% of that
+//! material, normalised to the water/lipid/protein simplex; ROI
 //! means that scatter outside the simplex under noise are projected back with a
 //! Mahalanobis (Σ⁻¹) MLE onto the triangle. Delivered maps add the coupled
 //! σ_f-weighted edge-preserving Huber-TV (never Gaussian — that wipes the
@@ -19,8 +21,8 @@
 //! anchor uses (water 0, lipid −111.7/−81.2, protein 270.6/290.1), so on the
 //! water/lipid axis it broadly agrees with the validated GLS; the QUADRATIC
 //! terms encode the sim's beam-hardening curvature and the PROTEIN axis, neither
-//! of which is validated on real scanner data. The held-out CCC (0.996/0.997/
-//! 0.998) is a SIM number. On real 70/150 VMI it is a reasonable first estimate
+//! of which is validated on real scanner data. The held-out CCC (0.982/0.990/
+//! 0.989) is a SIM number. On real 70/150 VMI it is a reasonable first estimate
 //! but its accuracy must be re-earned; a new scanner/chain should refit the
 //! surface from known-fraction ROIs in `wlp-decomposition` (`apply_wlp_model.jl`
 //! `fit_surface` → a fresh `wlp_model_<pair>.toml`), then re-bake [`WlpModel::baked`]
@@ -115,29 +117,31 @@ impl WlpModel {
         WlpModel {
             low_kev: 70.0,
             high_kev: 150.0,
+            // Endpoint-pinned (barycentric-indicator at water/lipid/protein) so
+            // pure materials decode to exactly 100% — see fit note in the notebook.
             cw: [
-                0.9816921046417943,
-                0.0305602657238091,
-                -0.03209369346133053,
-                7.2994977211689135e-6,
-                3.493437550077894e-5,
-                -3.686306718694418e-5,
+                1.0,
+                0.03155876909952963,
+                -0.03356858676164307,
+                1.9516893554874072e-5,
+                9.66840988347038e-5,
+                -0.00011932712142043603,
             ],
             cl: [
-                0.007906177132245515,
-                -0.024237158610823335,
-                0.022652848894738332,
-                -5.194252678906318e-6,
-                -2.6292117584007084e-5,
-                2.7061414397149835e-5,
+                -6.416748650785238e-17,
+                -0.02438851460716694,
+                0.023030338830520646,
+                -1.5686512041428118e-6,
+                -5.177952563700287e-5,
+                5.593330573449891e-5,
             ],
             cp: [
-                0.010401718225960189,
-                -0.006323107112985741,
-                0.009440844566592162,
-                -2.1052450422620846e-6,
-                -8.642257916770748e-6,
-                9.801652789792834e-6,
+                1.8145058998874857e-17,
+                -0.007170254492362232,
+                0.010538247931122019,
+                -1.7948242350714233e-5,
+                -4.490457319768504e-5,
+                6.339381568590412e-5,
             ],
             cl_aff: [
                 0.009616319311225403,
@@ -495,23 +499,24 @@ mod tests {
         // GOLDEN: the Rust port must reproduce `apply_wlp_model.jl`'s `decode` /
         // `decode_feas` bit-for-bit (proof the extraction is lossless). Values
         // captured from the verified Julia reference at these HU pairs. The
-        // dominant fraction is argmax, NOT ≈1 — the LS-fit surface maps pure
-        // endpoints to ~0.88 and REAL adipose (−104,−81) to f_l≈0.69 (well below
-        // its true ~0.85: the documented sim→real transfer bias, see module docs).
+        // Endpoints are PINNED so pure materials decode to exactly 100% (water
+        // (0,0)→f_w=1). Real adipose (−104,−81)→f_l≈0.785 (vs 0.69 for the old
+        // unconstrained fit — pinning also straightens the near-pure regime where
+        // real fat lives). Values captured from the verified Julia reference.
         let m = WlpModel::baked();
         let cases: [(f64, f64, [f64; 3], [f64; 3]); 4] = [
             (0.0, 0.0,
-             [0.981692104641794, 0.00790617713224552, 0.0104017182259602],
-             [0.981692104641794, 0.00790617713224552, 0.0104017182259602]),
+             [1.0, -6.41674865078524e-17, 1.81450589988749e-17],
+             [1.0, -6.41674865078524e-17, 1.81450589988749e-17]),
             (-104.0, -81.0,
-             [0.400634966763377, 0.692971646621936, -0.0936066133853126],
+             [0.277170963640265, 0.785438242252227, -0.062609205892492],
              [0.0, 1.0, 0.0]),
             (50.0, 45.0,
-             [1.07153813859375, -0.189912540556989, 0.118374401963238],
+             [1.04344356153402, -0.165985712507582, 0.122542150973565],
              [0.853655710372383, 0.0, 0.146344289627617]),
             (-60.0, -30.0,
-             [0.102252573863574, 0.788898557384696, 0.10884886875173],
-             [0.102252573863574, 0.788898557384696, 0.10884886875173]),
+             [0.0560191440695096, 0.820831944428277, 0.123148911502213],
+             [0.0560191440695096, 0.820831944428277, 0.123148911502213]),
         ];
         for (lo, hi, want_dec, want_feas) in cases {
             let d = m.decode(lo, hi);
@@ -565,7 +570,10 @@ mod tests {
         let m = WlpModel::baked();
         let json = serde_json::to_string(&m).unwrap();
         let back: WlpModel = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.decode(-104.0, -81.0), m.decode(-104.0, -81.0));
+        let (a, b) = (back.decode(-104.0, -81.0), m.decode(-104.0, -81.0));
+        for k in 0..3 {
+            assert!((a[k] - b[k]).abs() < 1e-12, "decode diverged after round-trip: {a:?} vs {b:?}");
+        }
         assert_eq!(back.gate, m.gate);
         assert_eq!(back.sigma_hu, m.sigma_hu);
         // A pre-dims session (no `dims` field) must still deserialize (serde default).
