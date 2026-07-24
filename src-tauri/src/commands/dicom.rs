@@ -339,10 +339,73 @@ pub struct SeriesDirInfo {
     pub num_files: usize,
 }
 
-/// List immediate subdirectories of a patient folder with file counts.
-///
-/// Returns folders sorted by name. Skips hidden / underscore-prefixed entries.
-/// Fast — does not parse any DICOM headers.
+/// Discover series folders under a patient dir, flattening ONE level of
+/// container folders: a subdir with no regular files but child dirs (the
+/// P-numbered layout's `VMI/{70keV 1 mm, 150keV 1 mm}`) contributes its
+/// children as `VMI/70keV 1 mm` entries instead of one fileless dead row.
+/// Skips hidden / underscore-prefixed names at both levels. Fast — no DICOM
+/// headers parsed.
+// ponytail: one flatten level; recurse if a 3rd nesting level ever ships.
+fn discover_series_dirs(root: &Path) -> Result<Vec<SeriesDirInfo>, String> {
+    // Hidden/underscore files don't count: a Finder-written `.DS_Store` on the
+    // SMB share must not turn a fileless container (`VMI/`) into a series row.
+    fn count_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                    .filter(|e| {
+                        let name = e.file_name();
+                        let name = name.to_string_lossy();
+                        !name.starts_with('.') && !name.starts_with('_')
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+    let mut out = Vec::new();
+    let read = std::fs::read_dir(root).map_err(|e| format!("read_dir: {e}"))?;
+    for entry in read.flatten() {
+        let Ok(file_type) = entry.file_type() else { continue };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name.starts_with('_') {
+            continue;
+        }
+        let num_files = count_files(&entry.path());
+        if num_files > 0 {
+            out.push(SeriesDirInfo {
+                name,
+                path: entry.path().to_string_lossy().to_string(),
+                num_files,
+            });
+            continue;
+        }
+        // Fileless dir — treat as a container and lift its child dirs.
+        let Ok(children) = std::fs::read_dir(entry.path()) else { continue };
+        for child in children.flatten() {
+            let Ok(child_type) = child.file_type() else { continue };
+            if !child_type.is_dir() {
+                continue;
+            }
+            let child_name = child.file_name().to_string_lossy().to_string();
+            if child_name.starts_with('.') || child_name.starts_with('_') {
+                continue;
+            }
+            out.push(SeriesDirInfo {
+                name: format!("{name}/{child_name}"),
+                path: child.path().to_string_lossy().to_string(),
+                num_files: count_files(&child.path()),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// List series folders of a patient with file counts (see `discover_series_dirs`).
 #[tauri::command]
 pub async fn list_series_dirs(patient_path: String) -> Result<Vec<SeriesDirInfo>, String> {
     let root = PathBuf::from(&patient_path);
@@ -350,37 +413,9 @@ pub async fn list_series_dirs(patient_path: String) -> Result<Vec<SeriesDirInfo>
         return Err(format!("not a directory: {patient_path}"));
     }
 
-    tokio::task::spawn_blocking(move || -> Result<Vec<SeriesDirInfo>, String> {
-        let mut out = Vec::new();
-        let read = std::fs::read_dir(&root).map_err(|e| format!("read_dir: {e}"))?;
-        for entry in read.flatten() {
-            let Ok(file_type) = entry.file_type() else { continue };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') || name.starts_with('_') {
-                continue;
-            }
-            // Count regular files (cheap directory scan, no DICOM parse).
-            let num_files = std::fs::read_dir(entry.path())
-                .map(|d| {
-                    d.flatten()
-                        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-                        .count()
-                })
-                .unwrap_or(0);
-            out.push(SeriesDirInfo {
-                name,
-                path: entry.path().to_string_lossy().to_string(),
-                num_files,
-            });
-        }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
-    })
-    .await
-    .map_err(|e| format!("list task failed: {e}"))?
+    tokio::task::spawn_blocking(move || discover_series_dirs(&root))
+        .await
+        .map_err(|e| format!("list task failed: {e}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +785,44 @@ fn folder_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+/// Display + dual-energy picks from `(path, keV)` series entries, by index:
+/// `(lowest_for_display, Some((low, high)) pair)`.
+///
+/// A keV pair must come from the SAME parent folder: the P-numbered layout has
+/// a non-contrast `TNC_70keV` at the patient root next to contrast
+/// `VMI/{70keV,150keV}` — pooling every keV would pair TNC with VMI-150 across
+/// contrast states and default the display to the non-contrast scan. Among
+/// same-parent groups with ≥2 distinct keVs the largest wins; the pair is that
+/// group's (lowest, highest); the display pick is the pair's low keV, falling
+/// back to the global lowest when no group has a valid pair.
+fn select_kev_series(series: &[(String, Option<f64>)]) -> (Option<usize>, Option<(usize, usize)>) {
+    let mut groups: std::collections::BTreeMap<&str, Vec<(usize, f64)>> = Default::default();
+    for (i, (path, kev)) in series.iter().enumerate() {
+        if let Some(k) = *kev {
+            let parent = Path::new(path).parent().and_then(|p| p.to_str()).unwrap_or("");
+            groups.entry(parent).or_default().push((i, k));
+        }
+    }
+    let pair = groups
+        .values()
+        .filter(|g| g.iter().any(|&(_, k)| k != g[0].1))
+        .max_by_key(|g| g.len())
+        .map(|g| {
+            let &(lo, _) = g.iter().reduce(|a, b| if b.1 < a.1 { b } else { a }).unwrap();
+            let &(hi, _) = g.iter().reduce(|a, b| if b.1 > a.1 { b } else { a }).unwrap();
+            (lo, hi)
+        });
+    let lowest = pair.map(|(lo, _)| lo).or_else(|| {
+        series
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, kev))| kev.map(|k| (i, k)))
+            .reduce(|a, b| if b.1 < a.1 { b } else { a })
+            .map(|(i, _)| i)
+    });
+    (lowest, pair)
+}
+
 fn build_dual_energy_volume(
     low: &PipelineLoadedVolume,
     high: &PipelineLoadedVolume,
@@ -973,21 +1046,15 @@ pub async fn load_patient_all(
         return Err(format!("not a directory: {patient_dir}"));
     }
 
-    // Discover series subfolders (cheap, no DICOM parse).
+    // Discover series subfolders (cheap, no DICOM parse). Flattens one level
+    // of container dirs (`VMI/70keV 1 mm`) — see `discover_series_dirs`.
     let subdirs = tokio::task::spawn_blocking({
         let root = root.clone();
         move || -> Result<Vec<(String, PathBuf)>, String> {
-            let mut out = Vec::new();
-            let read = std::fs::read_dir(&root).map_err(|e| format!("read_dir: {e}"))?;
-            for entry in read.flatten() {
-                let Ok(ty) = entry.file_type() else { continue };
-                if !ty.is_dir() { continue; }
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') || name.starts_with('_') { continue; }
-                out.push((name, entry.path()));
-            }
-            out.sort_by(|a, b| a.0.cmp(&b.0));
-            Ok(out)
+            Ok(discover_series_dirs(&root)?
+                .into_iter()
+                .map(|s| (s.name, PathBuf::from(s.path)))
+                .collect())
         }
     })
     .await
@@ -1079,18 +1146,12 @@ pub async fn load_patient_all(
         let n = d.name.to_ascii_lowercase();
         n.contains("ccta")
     });
-    // Lowest-keV MonoPlus index, if any.
-    let lowest_kev_index = {
-        let mut best: Option<(usize, f64)> = None;
-        for (i, d) in descriptors.iter().enumerate() {
-            if let Some(k) = d.kev {
-                if best.map(|(_, bk)| k < bk).unwrap_or(true) {
-                    best = Some((i, k));
-                }
-            }
-        }
-        best.map(|(i, _)| i)
-    };
+    // Display + dual-energy picks — same-parent keV grouping, so a root-level
+    // TNC_70keV neither becomes the default view nor pairs with VMI/150keV
+    // (see `select_kev_series`).
+    let kev_by_path: Vec<(String, Option<f64>)> =
+        descriptors.iter().map(|d| (d.path.clone(), d.kev)).collect();
+    let (lowest_kev_index, kev_pair) = select_kev_series(&kev_by_path);
 
     // Default the displayed volume to the lowest-keV series (e.g. 70 keV): the
     // low-keV image has the highest soft-tissue/fat contrast, which is where
@@ -1106,17 +1167,9 @@ pub async fn load_patient_all(
     if let Some(c) = ccta_index {
         need.push(c);
     }
-    {
-        let mut kevs: Vec<(usize, f64)> = descriptors
-            .iter()
-            .enumerate()
-            .filter_map(|(i, d)| d.kev.map(|k| (i, k)))
-            .collect();
-        kevs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        if kevs.len() >= 2 {
-            need.push(kevs[0].0); // lowest keV
-            need.push(kevs[kevs.len() - 1].0); // highest keV
-        }
+    if let Some((low_idx, high_idx)) = kev_pair {
+        need.push(low_idx);
+        need.push(high_idx);
     }
     need.sort_unstable();
     need.dedup();
@@ -1202,18 +1255,12 @@ pub async fn load_patient_all(
         }
     }
 
-    // Auto-pair the two lowest-keV MonoPlus series into state.dual_energy
-    // so MMD can run without a separate dual-energy load step. If the user
-    // loaded a patient without a keV pair, leave dual_energy alone.
-    let mut kev_entries: Vec<(usize, f64)> = descriptors
-        .iter()
-        .enumerate()
-        .filter_map(|(i, d)| d.kev.map(|k| (i, k)))
-        .collect();
-    kev_entries.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    if kev_entries.len() >= 2 {
-        let (low_idx, low_kev) = kev_entries[0];
-        let (high_idx, high_kev) = kev_entries[kev_entries.len() - 1];
+    // Auto-pair the chosen same-parent keV pair into state.dual_energy so MMD
+    // can run without a separate dual-energy load step. If the patient has no
+    // valid pair, leave dual_energy alone.
+    if let Some((low_idx, high_idx)) = kev_pair {
+        let low_kev = descriptors[low_idx].kev.expect("pair index has keV");
+        let high_kev = descriptors[high_idx].kev.expect("pair index has keV");
         let low_key = (
             descriptors[low_idx].path.clone(),
             descriptors[low_idx].uid.clone(),
@@ -1413,6 +1460,61 @@ mod tests {
         let bundle: serde_json::Value =
             serde_json::from_str(r#"{"fai":null,"mmd":{"summary":null}}"#).unwrap();
         assert_eq!(session_flags(&bundle), (false, false));
+    }
+
+    /// Regression for the P-numbered layout: a non-contrast `TNC_70keV` at the
+    /// patient root must neither become the display default nor pair with the
+    /// contrast `VMI/150keV` — the pair comes from the same parent folder.
+    #[test]
+    fn select_kev_pair_same_parent_only() {
+        let series = vec![
+            ("/r/P1/CCTA_kVp".to_string(), None),
+            ("/r/P1/TNC_70keV".to_string(), Some(70.0)),
+            ("/r/P1/VMI/150keV 1 mm".to_string(), Some(150.0)),
+            ("/r/P1/VMI/70keV 1 mm".to_string(), Some(70.0)),
+        ];
+        let (lowest, pair) = select_kev_series(&series);
+        assert_eq!(pair, Some((3, 2)), "pair = VMI 70 (low) + VMI 150 (high)");
+        assert_eq!(lowest, Some(3), "display defaults to the pair's low keV, not TNC");
+    }
+
+    #[test]
+    fn select_kev_flat_monoplus_layout_unchanged() {
+        let series = vec![
+            ("/r/p/CCTA_0.6mm".to_string(), None),
+            ("/r/p/MonoPlus_150keV".to_string(), Some(150.0)),
+            ("/r/p/MonoPlus_70keV".to_string(), Some(70.0)),
+        ];
+        let (lowest, pair) = select_kev_series(&series);
+        assert_eq!(pair, Some((2, 1)));
+        assert_eq!(lowest, Some(2));
+    }
+
+    #[test]
+    fn select_kev_single_series_no_pair() {
+        let series = vec![("/r/p/TNC_70keV".to_string(), Some(70.0))];
+        let (lowest, pair) = select_kev_series(&series);
+        assert_eq!(pair, None);
+        assert_eq!(lowest, Some(0), "no pair still yields a display pick");
+    }
+
+    #[test]
+    fn discover_series_flattens_one_container_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        std::fs::create_dir(p.join("TNC_70keV")).unwrap();
+        std::fs::write(p.join("TNC_70keV/a.dcm"), b"x").unwrap();
+        std::fs::create_dir_all(p.join("VMI/70keV 1 mm")).unwrap();
+        std::fs::write(p.join("VMI/70keV 1 mm/a.dcm"), b"x").unwrap();
+        std::fs::create_dir_all(p.join("VMI/150keV 1 mm")).unwrap();
+        std::fs::write(p.join("VMI/150keV 1 mm/a.dcm"), b"x").unwrap();
+        std::fs::write(p.join("protocol.json"), b"{}").unwrap();
+        // Finder writes .DS_Store on SMB shares — must not block the flatten.
+        std::fs::write(p.join("VMI/.DS_Store"), b"x").unwrap();
+        let out = discover_series_dirs(p).unwrap();
+        let names: Vec<&str> = out.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["TNC_70keV", "VMI/150keV 1 mm", "VMI/70keV 1 mm"]);
+        assert!(out.iter().all(|s| s.num_files == 1));
     }
 
     #[test]

@@ -33,7 +33,7 @@
   };
 
   let {
-    initialRootDir = '/Volumes/Molloilab/Shu Nie/UCI NAEOTOM CCTA Data',
+    initialRootDir = '/Volumes/ShuNie/UCI NAEOTOM CCTA Data',
     currentPath = null,
     onSelect,
     onSelectDualEnergy,
@@ -142,34 +142,49 @@
   }
 
   /** Parse a keV label from a folder/series name — matches `MonoPlus_70keV`,
-   *  `Mono 100 keV`, `kev-150`, etc. Returns null if no integer keV tag is
-   *  present. Same heuristic as the Rust-side `parse_kev_from_folder`. */
+   *  `Mono 100 keV`, `70keV 1 mm`. Returns null if no integer keV tag is
+   *  present. Requires a literal `keV` (never bare `kV`/`kVp`, which would
+   *  tag conventional CCTA_*kVp* folders) — same rule as the Rust-side
+   *  `parse_kev_from_folder`. */
   function parseKev(name: string): number | null {
-    const m = name.match(/(\d{2,3})\s*ke?v/i);
+    const m = name.match(/(\d{2,3})\s*kev/i);
     if (!m) return null;
     const n = parseInt(m[1], 10);
     return Number.isFinite(n) ? n : null;
   }
 
-  function handleSelectSeries(p: PatientInfo, s: SeriesDirInfo) {
-    // If the picked series has a keV tag AND a sibling with a different keV
-    // exists, load them together as a dual-energy pair. Otherwise fall back
-    // to single-volume load.
+  /** Parent folder of a series path. */
+  function parentDir(p: string): string {
+    return p.replace(/[\\/][^\\/]*$/, '');
+  }
+
+  /** The dual-energy partner of `s` among `siblings`, if any: a different-keV
+   *  series in the SAME parent folder (same acquisition) — a root-level
+   *  `TNC_70keV` must not pair with `VMI/150keV 1 mm`. Same rule as the
+   *  Rust-side `select_kev_series`. */
+  function findKevPair(siblings: SeriesDirInfo[], s: SeriesDirInfo): SeriesDirInfo | null {
     const kev = parseKev(s.name);
-    const siblings = seriesCache[p.id] ?? [];
-    if (kev !== null && onSelectDualEnergy) {
-      const pair = siblings.find((x) => {
-        if (x.path === s.path) return false;
+    if (kev === null) return null;
+    return (
+      siblings.find((x) => {
+        if (x.path === s.path || parentDir(x.path) !== parentDir(s.path)) return false;
         const k = parseKev(x.name);
         return k !== null && k !== kev;
-      });
-      if (pair) {
-        const pairKev = parseKev(pair.name)!;
-        const lowDir = kev <= pairKev ? s.path : pair.path;
-        const highDir = kev <= pairKev ? pair.path : s.path;
-        onSelectDualEnergy(lowDir, highDir);
-        return;
-      }
+      }) ?? null
+    );
+  }
+
+  function handleSelectSeries(p: PatientInfo, s: SeriesDirInfo) {
+    // A picked series with a same-folder different-keV partner loads as a
+    // dual-energy pair. Otherwise fall back to single-volume load.
+    const pair = onSelectDualEnergy ? findKevPair(seriesCache[p.id] ?? [], s) : null;
+    if (pair && onSelectDualEnergy) {
+      const kev = parseKev(s.name)!;
+      const pairKev = parseKev(pair.name)!;
+      const lowDir = kev <= pairKev ? s.path : pair.path;
+      const highDir = kev <= pairKev ? pair.path : s.path;
+      onSelectDualEnergy(lowDir, highDir);
+      return;
     }
     onSelect(s.path);
   }
@@ -323,8 +338,7 @@
                   <div class="py-2 text-[11px] text-text-secondary">No series subfolders.</div>
                 {:else}
                   {#each seriesCache[p.id]! as s (s.path)}
-                    {@const kev = parseKev(s.name)}
-                    {@const willPair = kev !== null && !!onSelectDualEnergy && (seriesCache[p.id] ?? []).some((x) => x.path !== s.path && parseKev(x.name) !== null && parseKev(x.name) !== kev)}
+                    {@const willPair = !!onSelectDualEnergy && findKevPair(seriesCache[p.id] ?? [], s) !== null}
                     <button
                       class="flex w-full items-center justify-between rounded px-2 py-1 text-left hover:bg-accent/10 active:bg-accent/20"
                       onclick={() => handleSelectSeries(p, s)}
