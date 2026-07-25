@@ -156,6 +156,36 @@ pub struct PatientInfo {
 ///
 /// Heuristic: name is non-hidden, contains at least one regular file (we don't
 /// scan deeply for DICOM headers — that would be slow over SMB).
+/// Numeric-aware name ordering so `P2 < P10` (plain byte sort lists
+/// P1, P10, P11, …, P19, P2). Digit runs compare as numbers; everything
+/// else compares bytewise.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn strip_zeros(d: &[u8]) -> &[u8] {
+        let n = d.iter().take_while(|&&c| c == b'0').count();
+        if n == d.len() { &d[d.len() - 1..] } else { &d[n..] }
+    }
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < ab.len() && j < bb.len() {
+        if ab[i].is_ascii_digit() && bb[j].is_ascii_digit() {
+            let si = i;
+            while i < ab.len() && ab[i].is_ascii_digit() { i += 1; }
+            let sj = j;
+            while j < bb.len() && bb[j].is_ascii_digit() { j += 1; }
+            let (da, db) = (strip_zeros(&ab[si..i]), strip_zeros(&bb[sj..j]));
+            let ord = da.len().cmp(&db.len()).then_with(|| da.cmp(db));
+            if ord != Ordering::Equal { return ord; }
+        } else {
+            let ord = ab[i].cmp(&bb[j]);
+            if ord != Ordering::Equal { return ord; }
+            i += 1;
+            j += 1;
+        }
+    }
+    (ab.len() - i).cmp(&(bb.len() - j))
+}
+
 fn looks_like_patient_dir(entry: &std::fs::DirEntry) -> bool {
     if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
         return false;
@@ -289,7 +319,7 @@ pub async fn list_patients(
                 out.push((name, entry.path()));
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.sort_by(|a, b| natural_cmp(&a.0, &b.0));
         Ok(out)
     })
     .await
@@ -401,7 +431,7 @@ fn discover_series_dirs(root: &Path) -> Result<Vec<SeriesDirInfo>, String> {
             });
         }
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.sort_by(|a, b| natural_cmp(&a.name, &b.name));
     Ok(out)
 }
 
@@ -1462,6 +1492,13 @@ mod tests {
         assert_eq!(session_flags(&bundle), (false, false));
     }
 
+    #[test]
+    fn natural_cmp_orders_p_numbers_numerically() {
+        let mut names = vec!["P10", "P2", "P1", "P78", "reports", "analysis", "P05"];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(names, vec!["P1", "P2", "P05", "P10", "P78", "analysis", "reports"]);
+    }
+
     /// Regression for the P-numbered layout: a non-contrast `TNC_70keV` at the
     /// patient root must neither become the display default nor pair with the
     /// contrast `VMI/150keV` — the pair comes from the same parent folder.
@@ -1513,7 +1550,8 @@ mod tests {
         std::fs::write(p.join("VMI/.DS_Store"), b"x").unwrap();
         let out = discover_series_dirs(p).unwrap();
         let names: Vec<&str> = out.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["TNC_70keV", "VMI/150keV 1 mm", "VMI/70keV 1 mm"]);
+        // natural_cmp: 70 < 150 numerically, so VMI/70keV lists first.
+        assert_eq!(names, vec!["TNC_70keV", "VMI/70keV 1 mm", "VMI/150keV 1 mm"]);
         assert!(out.iter().all(|s| s.num_files == 1));
     }
 
