@@ -1,0 +1,535 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>shu_pcat — coronary fat measurements</title>
+<style>
+  :root { color-scheme: dark; --bg:#1c1c1e; --panel:#2c2c2e; --line:#38383a;
+          --fg:#e5e5e7; --dim:#98989d; --accent:#0a84ff;
+          --ok:#30d158; --warn:#ffd60a; --bad:#ff453a;
+          --RCA:#44cc44; --LAD:#ff8c00; --LCx:#4488ff; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:13px/1.5 -apple-system,Segoe UI,system-ui,sans-serif; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex;
+           align-items:baseline; gap:12px; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; font-weight:600; }
+  .dim { color:var(--dim); font-size:11px; }
+  main { display:grid; grid-template-columns:170px 1fr; min-height:calc(100vh - 48px); }
+  nav { border-right:1px solid var(--line); padding:8px; overflow:auto; }
+  nav button { display:block; width:100%; text-align:left; background:none; border:0;
+               color:var(--fg); padding:6px 8px; border-radius:5px; cursor:pointer;
+               font:inherit; }
+  nav button:hover { background:var(--panel); }
+  nav button[aria-current="true"] { background:var(--accent); color:#fff; }
+  section { padding:14px; overflow:auto; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+          padding:12px; margin-bottom:12px; }
+  canvas { background:#000; border-radius:4px; display:block; }
+  .pix { image-rendering:pixelated; }
+  .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
+  .num { font-variant-numeric:tabular-nums; }
+  .hd { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;
+        margin-bottom:10px; }
+  .ves { font-weight:700; font-size:14px; }
+  .fai { font-size:22px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .unit { font-size:12px; color:var(--dim); font-weight:400; }
+  .dot { width:8px; height:8px; border-radius:99px; display:inline-block; }
+  .flag { font-size:11px; color:var(--warn); margin:0 0 8px; }
+  .flag.bad { color:var(--bad); }
+  label { font-size:11px; color:var(--dim); display:block; }
+  input[type=range] { width:150px; }
+  table { border-collapse:collapse; font-size:11px; }
+  td,th { padding:2px 10px 2px 0; text-align:left; }
+  th { color:var(--dim); font-weight:500; }
+  details summary { cursor:pointer; color:var(--dim); font-size:11px; }
+  #drop { border:1px dashed var(--line); border-radius:8px; padding:28px;
+          text-align:center; color:var(--dim); margin:16px; }
+  .cmp { font-size:11px; color:var(--dim); display:flex; align-items:center; gap:5px; }
+</style>
+
+<header>
+  <h1>shu_pcat</h1>
+  <span class="dim" id="rootNote">pick the shu_pcat folder</span>
+</header>
+
+<div id="drop">
+  <p>A browser cannot list a folder on its own. Point it at the tree beside this file.</p>
+  <p><button id="pick">Choose the shu_pcat folder</button></p>
+  <p class="dim">Nothing leaves your machine.</p>
+</div>
+
+<main hidden id="app">
+  <nav id="patients"></nav>
+  <section id="detail"></section>
+</main>
+
+<script>
+// Reads the tree written by tools/pcat_autofix.py (and, where it has not been re-run,
+// PCAT Workstation's own export).  Layout:
+//   <root>/<patient>/{manifest,centerline/,lumen/,fat/,views/,qc.json}
+// Files ending .orig.json are the pre-re-centring versions and drive the compare toggle.
+const files = new Map();
+let patients = [], current = null, compare = false;
+
+document.getElementById('pick').onclick = async () => {
+  const dir = await window.showDirectoryPicker();
+  files.clear();
+  await walk(dir, '');
+  patients = [...new Set([...files.keys()].map(p => p.split('/')[0]))]
+    .filter(p => files.has(p + '/manifest.json')).sort();
+  document.getElementById('drop').hidden = true;
+  document.getElementById('app').hidden = false;
+  document.getElementById('rootNote').textContent =
+    `${dir.name} · ${patients.length} patient${patients.length === 1 ? '' : 's'}`;
+  renderNav();
+  if (patients.length) show(patients[0]);
+};
+
+async function walk(dir, prefix) {
+  for await (const [name, h] of dir.entries()) {
+    // skip the tooling and the NIfTI cache: nothing here reads them, and the cache is
+    // hundreds of megabytes of volumes the picker would otherwise enumerate
+    if (!prefix && (name === 'tools' || name.startsWith('.'))) continue;
+    const path = prefix ? `${prefix}/${name}` : name;
+    if (h.kind === 'directory') await walk(h, path);
+    else files.set(path, h);
+  }
+}
+
+const has = p => files.has(p);
+const readJson = async p => JSON.parse(await (await files.get(p).getFile()).text());
+const readI16 = async p =>
+  new Int16Array(await (await files.get(p).getFile()).arrayBuffer());
+const maybe = async p => has(p) ? readJson(p) : null;
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const fmt = (x, d = 1) => (x == null || !isFinite(x)) ? '—' : (+x).toFixed(d);
+
+function renderNav() {
+  const nav = document.getElementById('patients');
+  nav.innerHTML = '';
+  for (const p of patients) {
+    const b = document.createElement('button');
+    b.textContent = p;
+    b.onclick = () => show(p);
+    b.dataset.patient = p;
+    nav.append(b);
+  }
+}
+
+const VESSELS = ['RCA', 'LAD', 'LCx'];
+
+async function show(p) {
+  current = p;
+  for (const b of document.querySelectorAll('#patients button'))
+    b.setAttribute('aria-current', String(b.dataset.patient === p));
+
+  const m = await readJson(`${p}/manifest.json`);
+  const el = document.getElementById('detail');
+  el.innerHTML = '';
+
+  const s = (m.series || []).find(x => x.name === m.measured_on) || {};
+  const head = document.createElement('div');
+  head.className = 'card';
+  head.innerHTML = `<div class="hd" style="margin:0">
+      <b style="font-size:14px">${esc(p)}</b>
+      <span class="dim">${esc(m.measured_on || '?')} ·
+        ${esc(s.kernel || '')} · ${s.slice_thickness_mm ?? '?'} mm ·
+        ${s.pixel_spacing_mm ? (+s.pixel_spacing_mm).toFixed(3) : '?'} mm pixels</span>
+      <label class="cmp" style="margin-left:auto">
+        <input type="checkbox" id="cmp"${compare ? ' checked' : ''}>
+        show the result before re-centring</label>
+    </div>
+    <details><summary>series and paths</summary>${seriesTable(m)}</details>`;
+  head.querySelector('#cmp').onchange = e => { compare = e.target.checked; show(p); };
+  el.append(head);
+
+  for (const v of VESSELS)
+    if (has(`${p}/fat/${v}.json`)) el.append(await vesselCard(p, v));
+}
+
+function seriesTable(m) {
+  const rows = (m.series || []).map(s => `<tr>
+      <td>${esc(s.role || '')}</td><td>${esc(s.name || '')}</td>
+      <td class="num">${s.n_slices ?? ''}</td><td>${esc(s.kernel || '')}</td>
+      <td>${esc(s.kev || '')}</td></tr>`).join('');
+  return `<table><tr><th></th><th>series</th><th>slices</th><th>kernel</th>
+      <th>keV</th></tr>${rows}</table>
+    <p class="dim">images at <code>${esc(m.source_patient_dir || '?')}</code></p>`;
+}
+
+// ---------------------------------------------------------------------------
+
+async function vesselCard(p, v) {
+  const c = document.createElement('div');
+  c.className = 'card';
+  const fat = await readJson(`${p}/fat/${v}.json`);
+  const cl = await maybe(`${p}/centerline/${v}.json`);
+  const lum = await maybe(`${p}/lumen/${v}.json`);
+  const view = await maybe(`${p}/views/${v}.json`);
+  const old = compare ? {
+    fat: await maybe(`${p}/fat/${v}.orig.json`),
+    lum: await maybe(`${p}/lumen/${v}.orig.json`),
+  } : null;
+
+  const d = fat.depot || {};
+  const sh = fat.shell || {};
+  const sp = fat.spectral;
+
+  c.innerHTML = `<div class="hd">
+      <span class="ves" style="color:var(--${v})">${v}</span>
+      <span class="fai">${fmt(sh.hu_mean)}<span class="unit"> HU FAI</span></span>
+      <span class="dim">peak ${fmt(sh.fit_mean_hu)} ± ${fmt(sh.fit_sigma_hu)} ·
+        at σ=30 ${fmt(sh.hu_mean_sigma30)}</span>
+      <span class="dim">· ${fmt(fat.segment_achieved_mm)} mm ·
+        lumen ${fmt(fat.mean_lumen_diameter_mm, 2)} mm ⌀ ·
+        shell ${fmt(sh.thickness_mm, 2)} mm from the wall ·
+        ${Math.round(100 * sh.fat_fraction)}% of it is fat</span>
+      ${old?.fat ? `<span class="dim">· was <b>${fmt(old.fat.hu_mean)}</b> HU on the
+        old geometry</span>` : ''}
+    </div>
+    ${sp && sp.coverage > 0.9 ? `<p class="dim" style="margin:-4px 0 8px">
+        ${sp.kev[1]} keV ${fmt(sp.hu_high)} HU · Δ${fmt(sp.hu_low_minus_high)} HU ·
+        adipose fraction ${fmt(sp.adipose_fraction, 3)} ·
+        iodine ${fmt(sp.iodine_mg_ml, 2)} mg/mL</p>` : ''}`;
+
+  flags(c, cl, lum, fat, sp);
+
+  const row = document.createElement('div');
+  row.className = 'row';
+  c.append(row);
+  if (view?.cpr) row.append(await cprPanel(p, v, view, lum));
+  if (view) row.append(await sectionPanel(p, v, view, lum, d, fat, old));
+  row.append(profiles(cl, lum, fat));
+  row.append(histPanel(fat));
+  if (view?.faimap) row.append(await faiPanel(p, v, view, fat));
+  return c;
+}
+
+/** The whole fat distribution, not just the part the window kept. */
+function histPanel(fat) {
+  const sh = fat.shell || {};
+  const h = sh.hist_mm3 || [];
+  const W = 260, H = 108, L = 34, B = 20, T = 8, R = 8;
+  const wrap = document.createElement('div');
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H; cv.style.cssText = `width:${W}px;height:${H}px`;
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  if (h.length) {
+    const lo = sh.hist_lo, bin = sh.hist_bin, hi = lo + bin * h.length;
+    const max = Math.max(...h);
+    const X = hu => L + (W - L - R) * (hu - lo) / (hi - lo);
+    const Y = y => H - B - (H - B - T) * y / max;
+    const [glo, ghi] = fat.gate_hu || [-190, -30];
+    ctx.fillStyle = '#3a3a3c';
+    ctx.fillRect(X(lo), T, X(glo) - X(lo), H - B - T);
+    ctx.fillRect(X(ghi), T, X(hi) - X(ghi), H - B - T);
+    ctx.beginPath();
+    h.forEach((y, i) => {
+      const x = X(lo + bin * (i + 0.5));
+      i ? ctx.lineTo(x, Y(y)) : ctx.moveTo(x, Y(y));
+    });
+    ctx.lineTo(X(hi), H - B); ctx.lineTo(X(lo), H - B); ctx.closePath();
+    ctx.fillStyle = 'rgba(255,214,10,.75)'; ctx.fill();
+    if (isFinite(sh.fit_mean_hu)) {
+      ctx.strokeStyle = '#4ec9ff'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(X(sh.fit_mean_hu), T);
+      ctx.lineTo(X(sh.fit_mean_hu), H - B); ctx.stroke();
+    }
+    ctx.font = '9px system-ui'; ctx.fillStyle = '#98989d';
+    ctx.fillText(lo + '', L - 6, H - 6);
+    ctx.fillText(glo + '', X(glo) - 10, H - 6);
+    ctx.fillText(ghi + '', X(ghi) - 8, H - 6);
+    ctx.fillStyle = '#e5e5e7'; ctx.fillText('shell histogram (mm³ per HU bin)', L + 4, T + 8);
+  }
+  wrap.append(cv);
+  wrap.insertAdjacentHTML('beforeend',
+    `<p class="dim" style="max-width:260px">grey = outside the −190…−30 window ·
+      blue = the fitted fat peak ·
+      ${fmt(100 * sh.frac_below_window, 2)}% of the shell falls below −190 HU,
+      ${fmt(100 * sh.frac_above_window, 0)}% above −30 (wall and myocardium)</p>`);
+  return wrap;
+}
+
+function flags(c, cl, lum, fat, sp) {
+  const out = [];
+  const sh = fat.shell || {};
+  const off = (lum?.axis_hu || []).filter((h, i) => lum.detected?.[i] === false).length;
+  if (off) out.push([true, `${off} of ${lum.axis_hu.length} cross-sections have no
+      contrast on the axis — those are not measurable, not merely noisy.`]);
+  const ceil = (lum?.frac_at_ceiling || []).filter(x => x > 0.1).length;
+  if (ceil) out.push([true, `${ceil} cross-sections have more than a tenth of the
+      contour pinned at the ${fmt(lum.max_search_radius_mm, 1)} mm search limit.`]);
+  if (sh.fit_failed) out.push([true, `No fat peak could be fitted: only
+      ${Math.round(100 * sh.fat_fraction)}% of this shell is fat, so the shell is
+      mostly myocardium and the FAI here is an average over whatever survived the
+      window. Treat it as unusable rather than low.`]);
+  if (fat.wall_found_fraction < 0.85)
+    out.push([false, `${Math.round(100 * (1 - fat.wall_found_fraction))}% of the rays
+      never reach fat, so the outer wall there is a least-bad guess rather than a
+      boundary. Those rays contribute nothing to the average.`]);
+  const t = cl?.trimmed_mm;
+  const lost = (t?.proximal_mm || 0) + (t?.distal_mm || 0)
+             + (t?.anchor_proximal_mm || 0) + (t?.anchor_distal_mm || 0);
+  if (lost > 0.5)
+    out.push([false, `${fmt(lost)} mm of the operator's segment was dropped: the trace
+      ran past the end of the opacified vessel${
+        t.interior_gap_mm > 0.5 ? `, and a ${fmt(t.interior_gap_mm)} mm stretch inside
+        it had no lumen either` : ''}.`]);
+  if (sp && sp.coverage <= 0.9)
+    out.push([true, `The ${sp.kev[1]} keV series covers only
+      ${Math.round(100 * sp.coverage)}% of this vessel — that folder is missing slices,
+      so no spectral result is reported.`]);
+  const open = (fat.depot?.open_at_max || []).flat();
+  const openN = open.filter(Boolean).length;
+  if (openN / Math.max(open.length, 1) > 0.05)
+    out.push([false, `${Math.round(100 * openN / open.length)}% of the depot rays
+      reached the ${fat.depot.max_radius_mm} mm limit still in fat, so the depot
+      thickness is a lower bound. The FAI shell is a separate measurement and is
+      unaffected.`]);
+  for (const [bad, msg] of out)
+    c.insertAdjacentHTML('beforeend',
+      `<p class="flag${bad ? ' bad' : ''}">${msg}</p>`);
+}
+
+// --- the vessel laid out flat: the one view that shows a bad axis at a glance ------
+
+async function cprPanel(p, v, view, lum) {
+  const c = view.cpr;
+  const raw = await readI16(`${p}/${view.cpr_file}`);
+  const W = c.width, H = c.height, NA = c.angles;
+  const wrap = document.createElement('div');
+  const scale = Math.min(2, Math.max(1, Math.round(420 / W)));
+  wrap.innerHTML = `<canvas width="${W}" height="${H}"
+      style="width:${W * scale}px;height:${H * scale}px"></canvas>
+    <div style="display:flex;gap:14px;margin-top:4px">
+      <div><label>view angle <span class="num" id="ca-${v}">0°</span></label>
+        <input type="range" min="0" max="${NA - 1}" value="0" id="cang-${v}"></div>
+      <div><label>window <span class="num" id="cw-${v}"></span></label>
+        <input type="range" min="-200" max="900" value="150" id="clev-${v}">
+        <input type="range" min="100" max="1600" value="800" id="cwid-${v}"></div>
+    </div>
+    <p class="dim">the vessel straightened out · x = mm along it, y = ±${
+      c.half_width_mm} mm across · <span style="color:#4ec9ff">—</span> lumen edge</p>`;
+
+  const cv = wrap.querySelector('canvas'), ctx = cv.getContext('2d');
+  const draw = () => {
+    const a = +wrap.querySelector(`#cang-${v}`).value;
+    const lev = +wrap.querySelector(`#clev-${v}`).value;
+    const wid = +wrap.querySelector(`#cwid-${v}`).value;
+    wrap.querySelector(`#ca-${v}`).textContent = Math.round(a * 180 / NA) + '°';
+    wrap.querySelector(`#cw-${v}`).textContent = `${lev - wid / 2}…${lev + wid / 2}`;
+    const img = ctx.createImageData(W, H), off = a * W * H;
+    for (let i = 0; i < W * H; i++) {
+      const g = clamp8((raw[off + i] - (lev - wid / 2)) / wid * 255);
+      img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = g;
+      img.data[i * 4 + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+    // the lumen edge on this cut, in the same pixel frame
+    const e = c.lumen_edge_mm[a], mid = (H - 1) / 2, mm = 1 / c.step_mm;
+    ctx.lineWidth = 0.7; ctx.strokeStyle = '#4ec9ff';
+    for (const [sgn, arr] of [[-1, e[0]], [1, e[1]]]) {
+      ctx.beginPath();
+      arr.forEach((r, i) => i ? ctx.lineTo(i, mid + sgn * r * mm)
+                              : ctx.moveTo(i, mid + sgn * r * mm));
+      ctx.stroke();
+    }
+  };
+  wrap.querySelectorAll('input').forEach(i => i.oninput = draw);
+  draw();
+  return wrap;
+}
+
+const clamp8 = x => Math.max(0, Math.min(255, Math.round(x)));
+
+// --- one cross-section, with only the measured tissue tinted -----------------------
+
+async function sectionPanel(p, v, view, lum, depot, fat, old) {
+  const raw = await readI16(`${p}/${view.data_file}`);
+  const N = view.pixels, n = view.section_index.length;
+  const wrap = document.createElement('div');
+  wrap.innerHTML = `<canvas class="pix" width="${N}" height="${N}"
+      style="width:240px;height:240px"></canvas>
+    <div><label>section <span class="num" id="si-${v}"></span></label>
+      <input type="range" min="0" max="${n - 1}" value="${n >> 1}" id="sec-${v}"></div>
+    <div><label>window <span class="num" id="sw-${v}"></span></label>
+      <input type="range" min="-300" max="800" value="150" id="slev-${v}">
+      <input type="range" min="100" max="1600" value="700" id="swid-${v}"></div>
+    <p class="dim"><span style="color:#4ec9ff">—</span> lumen ·
+      <span style="color:#40ff90">—</span> outer wall ·
+      <span style="color:#ffd60a">—</span> outer edge of the FAI shell ·
+      <span style="color:#ff6b6b">┈</span> depot edge${
+        old?.lum ? ' · <span style="color:#ff453a">—</span> before' : ''}</p>`;
+
+  const cv = wrap.querySelector('canvas'), ctx = cv.getContext('2d');
+  const mm = (N - 1) / (2 * view.half_width_mm);
+  const [lo, hi] = fat.gate_hu || [-190, -30];
+
+  const ring = (r, colour, dash, th) => {
+    if (!r) return;
+    ctx.save(); ctx.strokeStyle = colour; ctx.lineWidth = 0.9;
+    ctx.setLineDash(dash || []); ctx.beginPath();
+    r.forEach((rv, a) => {
+      const t = th ? th[a] : a * 2 * Math.PI / r.length;
+      const x = N / 2 + rv * Math.cos(t) * mm, y = N / 2 + rv * Math.sin(t) * mm;
+      a ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.closePath(); ctx.stroke(); ctx.restore();
+  };
+
+  const draw = () => {
+    const k = +wrap.querySelector(`#sec-${v}`).value;
+    const s = view.section_index[k];
+    wrap.querySelector(`#si-${v}`).textContent =
+      `${k + 1}/${n} · ${fmt(view.arc_mm[k])} mm · axis ${
+        fmt(lum?.axis_hu?.[s], 0)} HU`;
+
+    const lev = +wrap.querySelector(`#slev-${v}`).value;
+    const wid = +wrap.querySelector(`#swid-${v}`).value;
+    wrap.querySelector(`#sw-${v}`).textContent = `${lev - wid / 2}…${lev + wid / 2}`;
+
+    const rL = lum?.r_theta_mm?.[s], rO = depot?.r_out_mm?.[s];
+    const rW = fat.r_wall_mm?.[s];
+    const shellW = fat.shell?.thickness_mm ?? 3;
+    const img = ctx.createImageData(N, N), off = k * N * N;
+    for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+      const idx = j * N + i, hu = raw[off + idx];
+      const g = clamp8((hu - (lev - wid / 2)) / wid * 255);
+      // Only the tissue that actually entered the average is tinted.  Painting every
+      // voxel in the fat window turned the whole patch orange and said nothing about
+      // where the number came from.
+      const dx = (i - N / 2) / mm, dy = (j - N / 2) / mm;
+      const r = Math.hypot(dx, dy);
+      let inRing = false;
+      if (rW) {
+        let a = Math.atan2(dy, dx); if (a < 0) a += 2 * Math.PI;
+        const rw = rW[Math.min(rW.length - 1,
+                               Math.round(a / (2 * Math.PI) * rW.length)) % rW.length];
+        inRing = r >= rw && r <= rw + shellW && hu >= lo && hu <= hi;
+      }
+      img.data[idx * 4]     = inRing ? 255 : g;
+      img.data[idx * 4 + 1] = inRing ? 190 : g;
+      img.data[idx * 4 + 2] = inRing ? 60 : g;
+      img.data[idx * 4 + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+
+    if (rL) ring(rL, '#4ec9ff');
+    if (rW) {
+      ring(rW, '#40ff90');
+      ring(rW.map(x => x + shellW), '#ffd60a');
+    }
+    ring(rO, '#ff6b6b', [3, 3]);
+    if (old?.lum) ring(old.lum.r_theta_mm?.[s], '#ff453a', [], old.lum.theta_rad);
+    ctx.fillStyle = '#fff'; ctx.fillRect(N / 2 - 1, N / 2 - 1, 2, 2);
+  };
+  wrap.querySelectorAll('input').forEach(i => i.oninput = draw);
+  draw();
+  return wrap;
+}
+
+// --- two plots, each with its own axis and its own units ---------------------------
+
+function plot(series, xmax, ylab, opts = {}) {
+  const W = 260, H = 108, L = 38, B = 20, T = 8, R = 8;
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H; cv.style.cssText = `width:${W}px;height:${H}px`;
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  const all = series.flatMap(s => s.y).filter(Number.isFinite);
+  if (!all.length) return cv;
+  let y0 = opts.y0 ?? Math.min(...all), y1 = opts.y1 ?? Math.max(...all);
+  if (y1 - y0 < 1e-6) { y0 -= 1; y1 += 1; }
+  const pad = 0.12 * (y1 - y0);
+  y0 = opts.y0 != null ? opts.y0 : y0 - pad;      // a diameter axis must not go
+  y1 += pad;                                      // below zero just to leave a margin
+  const X = i => L + (W - L - R) * i, Y = y => H - B - (H - B - T) * (y - y0) / (y1 - y0);
+
+  ctx.font = '9px system-ui'; ctx.strokeStyle = '#38383a'; ctx.fillStyle = '#98989d';
+  for (const t of [y0, (y0 + y1) / 2, y1]) {
+    ctx.beginPath(); ctx.moveTo(L, Y(t)); ctx.lineTo(W - R, Y(t)); ctx.stroke();
+    ctx.fillText(t.toFixed(Math.abs(y1 - y0) > 20 ? 0 : 1), 2, Y(t) + 3);
+  }
+  if (opts.mark != null && opts.mark > y0 && opts.mark < y1) {
+    ctx.save(); ctx.setLineDash([3, 3]); ctx.strokeStyle = '#ff453a';
+    ctx.beginPath(); ctx.moveTo(L, Y(opts.mark)); ctx.lineTo(W - R, Y(opts.mark));
+    ctx.stroke(); ctx.restore();
+  }
+  for (const s of series) {
+    ctx.strokeStyle = s.c; ctx.lineWidth = 1.2; ctx.beginPath();
+    let started = false;
+    s.y.forEach((yv, i) => {
+      if (!Number.isFinite(yv)) { started = false; return; }
+      const x = X(i / Math.max(s.y.length - 1, 1));
+      started ? ctx.lineTo(x, Y(yv)) : ctx.moveTo(x, Y(yv));
+      started = true;
+    });
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#98989d';
+  ctx.fillText('0', L - 3, H - 6);
+  ctx.fillText(xmax.toFixed(0) + ' mm', W - 46, H - 6);
+  ctx.fillStyle = '#e5e5e7'; ctx.fillText(ylab, L + 4, T + 8);
+  return cv;
+}
+
+function profiles(cl, lum, fat) {
+  const wrap = document.createElement('div');
+  const len = cl?.arclength_mm?.slice(-1)[0] ?? fat.segment_achieved_mm ?? 1;
+  const dia = (lum?.r_eq_mm || []).map(r => 2 * r);
+  wrap.append(plot([{ y: dia, c: '#4ec9ff' }], len, 'lumen diameter (mm)', { y0: 0 }));
+  const fai = fat.shell?.fai_per_section_hu || [];
+  wrap.append(plot([{ y: fai, c: '#ffd60a' }], len, 'FAI along the vessel (HU)',
+                   { mark: fat.reference_cutoff_hu }));
+  wrap.insertAdjacentHTML('beforeend',
+    `<p class="dim" style="max-width:260px">red dashes mark −70.1 HU, a 120 kVp
+      energy-integrating cut-off shown for orientation only — it does not transfer to
+      this reconstruction</p>`);
+  return wrap;
+}
+
+// --- the FAI as a map, with a scale you can read ----------------------------------
+
+const INFERNO = [[0,0,4],[40,11,84],[101,21,110],[159,42,99],[212,72,66],
+                 [245,125,21],[250,193,39],[252,255,164]];
+function ramp(u) {
+  u = Math.max(0, Math.min(1, u)) * (INFERNO.length - 1);
+  const i = Math.min(INFERNO.length - 2, Math.floor(u)), f = u - i;
+  return INFERNO[i].map((c, k) => c + f * (INFERNO[i + 1][k] - c));
+}
+
+async function faiPanel(p, v, view, fat) {
+  const meta = view.faimap;
+  const raw = await readI16(`${p}/${view.faimap_file}`);
+  const S = meta.sections, A = meta.angles;
+  const [lo, hi] = [-160, -20];
+  const wrap = document.createElement('div');
+  wrap.innerHTML = `<canvas width="${S}" height="${A}"
+      style="width:260px;height:110px"></canvas>
+    <canvas width="260" height="26" style="width:260px;height:26px"></canvas>
+    <p class="dim" style="max-width:260px">FAI per cross-section and angle ·
+      x = 0…${fmt(fat.segment_achieved_mm, 0)} mm along the vessel, y = one full turn
+      around it · grey = the ring held no fat there</p>`;
+
+  const [cv, bar] = wrap.querySelectorAll('canvas');
+  const ctx = cv.getContext('2d'), img = ctx.createImageData(S, A);
+  for (let a = 0; a < A; a++) for (let s = 0; s < S; s++) {
+    const val = raw[s * A + a], o = (a * S + s) * 4;
+    const c = val === meta.nodata ? [70, 70, 74] : ramp((val - lo) / (hi - lo));
+    img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2];
+    img.data[o + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+
+  const bx = bar.getContext('2d');
+  for (let x = 0; x < 260; x++) {
+    const c = ramp(x / 259);
+    bx.fillStyle = `rgb(${c.map(Math.round).join(',')})`;
+    bx.fillRect(x, 0, 1, 12);
+  }
+  bx.font = '9px system-ui'; bx.fillStyle = '#98989d';
+  bx.fillText(lo + ' HU', 0, 23);
+  bx.fillText(hi + ' HU', 216, 23);
+  return wrap;
+}
+</script>

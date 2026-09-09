@@ -1,0 +1,6 @@
+# Never commit the export tree or the volume cache: both are patient data.
+P*/
+.cache/
+*.nii.gz
+*.i16
+qc.json
