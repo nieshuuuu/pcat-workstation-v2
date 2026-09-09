@@ -1,0 +1,11 @@
+patient    ref | series with fewer slices than the reference
+P101       383 | 100 kev  0.4 mm=334, 65 kev 0.4 mm=304, 70keV 0.4 mm=325
+P108       340 | 150 kev 0.4 mm=258
+P92        352 | 140kev 0.4 mm=155, 150keV 0.4 mm=123, T3D 0.4 mm=100
+
+3 of 131 patients have at least one short VMI series
+
+150 keV status
+  P108     150 keV short: 258 of 340
+  P92      150 keV short: 123 of 352
+  complete 129 | short 2 | missing 0
